@@ -90,7 +90,7 @@ def register_attention_control(model, controller):
             hidden_states = attn.batch_to_head_dim(hidden_states)
 
             # linear proj   
-            hidden_states = attn.to_out[0](hidden_states, scale=scale)
+            hidden_states = attn.to_out[0](hidden_states, )
             # dropout
             hidden_states = attn.to_out[1](hidden_states)
 
