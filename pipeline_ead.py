@@ -1,6 +1,8 @@
 import inspect
 from typing import Any, Callable, Dict, List, Optional, Union
-
+import os
+import PIL.Image
+from tqdm import tqdm
 import numpy as np
 import PIL
 import torch
@@ -17,7 +19,9 @@ from diffusers.utils import PIL_INTERPOLATION, deprecate, logging
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.pipelines.stable_diffusion import StableDiffusionPipelineOutput
-from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
+from diffusers.pipelines.stable_diffusion.safety_checker import (
+    StableDiffusionSafetyChecker,
+)
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -36,7 +40,10 @@ def preprocess(image):
         w, h = image[0].size
         w, h = (x - x % 8 for x in (w, h))  # resize to integer multiple of 8
 
-        image = [np.array(i.resize((w, h), resample=PIL_INTERPOLATION["lanczos"]))[None, :] for i in image]
+        image = [
+            np.array(i.resize((w, h), resample=PIL_INTERPOLATION["lanczos"]))[None, :]
+            for i in image
+        ]
         image = np.concatenate(image, axis=0)
         image = np.array(image).astype(np.float32) / 255.0
         image = image.transpose(0, 3, 1, 2)
@@ -47,16 +54,19 @@ def preprocess(image):
     return image
 
 
-def ddcm_sampler(scheduler, x_s, x_t, timestep, e_s, e_t, x_0, noise, eta, to_next=True):
+def ddcm_sampler(
+    scheduler, x_s, x_t, timestep, e_s, e_t, x_0, noise, eta, timestep_idx, to_next=True
+):
     if scheduler.num_inference_steps is None:
         raise ValueError(
             "Number of inference steps is 'None', you need to run 'set_timesteps' after creating the scheduler"
         )
-    
-    if scheduler.step_index is None:
-        scheduler._init_step_index(timestep)
 
-    prev_step_index = scheduler.step_index + 1
+    # if scheduler.step_index is None:
+    #     scheduler._init_step_index(timestep)
+    # prev_step_index = scheduler.step_index + 1
+
+    prev_step_index = timestep_idx + 1
     if prev_step_index < len(scheduler.timesteps):
         prev_timestep = scheduler.timesteps[prev_step_index]
     else:
@@ -64,7 +74,9 @@ def ddcm_sampler(scheduler, x_s, x_t, timestep, e_s, e_t, x_0, noise, eta, to_ne
 
     alpha_prod_t = scheduler.alphas_cumprod[timestep]
     alpha_prod_t_prev = (
-        scheduler.alphas_cumprod[prev_timestep] if prev_timestep >= 0 else scheduler.final_alpha_cumprod
+        scheduler.alphas_cumprod[prev_timestep]
+        if prev_timestep >= 0
+        else scheduler.final_alpha_cumprod
     )
     beta_prod_t = 1 - alpha_prod_t
     beta_prod_t_prev = 1 - alpha_prod_t_prev
@@ -74,8 +86,13 @@ def ddcm_sampler(scheduler, x_s, x_t, timestep, e_s, e_t, x_0, noise, eta, to_ne
 
     e_c = (x_s - alpha_prod_t ** (0.5) * x_0) / (1 - alpha_prod_t) ** (0.5)
 
-    pred_x0 = x_0 + ((x_t - x_s) - beta_prod_t ** (0.5) * (e_t - e_s)) / alpha_prod_t ** (0.5)
-    eps = (e_t - e_s) + e_c
+    pred_x0 = x_0 + (
+        (x_t - x_s) - beta_prod_t ** (0.5) * (e_t - e_s)
+    ) / alpha_prod_t ** (0.5)
+    # pred_x0 = (
+    #     x_t - beta_prod_t**0.5 * (e_c + (e_t - e_s) * weights)
+    # ) / alpha_prod_t ** (0.5)
+    eps = e_c + (e_t - e_s)
     dir_xt = (beta_prod_t_prev - std_dev_t) ** (0.5) * eps
 
     # Noise is not used for one-step sampling.
@@ -85,10 +102,28 @@ def ddcm_sampler(scheduler, x_s, x_t, timestep, e_s, e_t, x_0, noise, eta, to_ne
     else:
         prev_xt = pred_x0
         prev_xs = x_0
-    
-    if to_next:
-      scheduler._step_index += 1
+
+    # if to_next:
+    #     scheduler._step_index += 1
     return prev_xs, prev_xt, pred_x0
+
+
+## following MultiDiffusion: https://github.com/omerbt/MultiDiffusion/blob/master/panorama.py ##
+## the window size is changed for 360-degree panorama generation ##
+def get_views(panorama_height, panorama_width, window_size=[64, 128], stride=16):
+    panorama_height /= 8
+    panorama_width /= 8
+    num_blocks_height = (panorama_height - window_size[0]) // stride + 1
+    num_blocks_width = (panorama_width - window_size[1]) // stride + 1
+    total_num_blocks = int(num_blocks_height * num_blocks_width)
+    views = []
+    for i in range(total_num_blocks):
+        h_start = int((i // num_blocks_width) * stride)
+        h_end = h_start + window_size[0]
+        w_start = int((i % num_blocks_width) * stride)
+        w_end = w_start + window_size[1]
+        views.append((h_start, h_end, w_start, w_end))
+    return views
 
 
 class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMixin):
@@ -108,7 +143,10 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
     ):
         super().__init__()
 
-        if hasattr(scheduler.config, "steps_offset") and scheduler.config.steps_offset != 1:
+        if (
+            hasattr(scheduler.config, "steps_offset")
+            and scheduler.config.steps_offset != 1
+        ):
             deprecation_message = (
                 f"The configuration file of this scheduler: {scheduler} is outdated. `steps_offset`"
                 f" should be set to 1 instead of {scheduler.config.steps_offset}. Please make sure "
@@ -117,7 +155,9 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
                 " it would be very nice if you could open a Pull request for the `scheduler/scheduler_config.json`"
                 " file"
             )
-            deprecate("steps_offset!=1", "1.0.0", deprecation_message, standard_warn=False)
+            deprecate(
+                "steps_offset!=1", "1.0.0", deprecation_message, standard_warn=False
+            )
             new_config = dict(scheduler.config)
             new_config["steps_offset"] = 1
             scheduler._internal_dict = FrozenDict(new_config)
@@ -137,10 +177,14 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
                 "Make sure to define a feature extractor when loading {self.__class__} if you want to use the safety"
                 " checker. If you do not want to use the safety checker, you can pass `'safety_checker=None'` instead."
             )
-        is_unet_version_less_0_9_0 = hasattr(unet.config, "_diffusers_version") and version.parse(
+        is_unet_version_less_0_9_0 = hasattr(
+            unet.config, "_diffusers_version"
+        ) and version.parse(
             version.parse(unet.config._diffusers_version).base_version
         ) < version.parse("0.9.0.dev0")
-        is_unet_sample_size_less_64 = hasattr(unet.config, "sample_size") and unet.config.sample_size < 64
+        is_unet_sample_size_less_64 = (
+            hasattr(unet.config, "sample_size") and unet.config.sample_size < 64
+        )
         if is_unet_version_less_0_9_0 and is_unet_sample_size_less_64:
             deprecation_message = (
                 "The configuration file of the unet has set the default `sample_size` to smaller than"
@@ -153,7 +197,9 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
                 " checkpoint from the Hugging Face Hub, it would be very nice if you could open a Pull request for"
                 " the `unet/config.json` file"
             )
-            deprecate("sample_size<64", "1.0.0", deprecation_message, standard_warn=False)
+            deprecate(
+                "sample_size<64", "1.0.0", deprecation_message, standard_warn=False
+            )
             new_config = dict(unet.config)
             new_config["sample_size"] = 64
             unet._internal_dict = FrozenDict(new_config)
@@ -242,11 +288,13 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
                 return_tensors="pt",
             )
             text_input_ids = text_inputs.input_ids
-            untruncated_ids = self.tokenizer(prompt, padding="longest", return_tensors="pt").input_ids
+            untruncated_ids = self.tokenizer(
+                prompt, padding="longest", return_tensors="pt"
+            ).input_ids
 
-            if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(
-                text_input_ids, untruncated_ids
-            ):
+            if untruncated_ids.shape[-1] >= text_input_ids.shape[
+                -1
+            ] and not torch.equal(text_input_ids, untruncated_ids):
                 removed_text = self.tokenizer.batch_decode(
                     untruncated_ids[:, self.tokenizer.model_max_length - 1 : -1]
                 )
@@ -255,7 +303,10 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
                     f" {self.tokenizer.model_max_length} tokens: {removed_text}"
                 )
 
-            if hasattr(self.text_encoder.config, "use_attention_mask") and self.text_encoder.config.use_attention_mask:
+            if (
+                hasattr(self.text_encoder.config, "use_attention_mask")
+                and self.text_encoder.config.use_attention_mask
+            ):
                 attention_mask = text_inputs.attention_mask.to(device)
             else:
                 attention_mask = None
@@ -278,7 +329,9 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
         bs_embed, seq_len, _ = prompt_embeds.shape
         # duplicate text embeddings for each generation per prompt, using mps friendly method
         prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
-        prompt_embeds = prompt_embeds.view(bs_embed * num_images_per_prompt, seq_len, -1)
+        prompt_embeds = prompt_embeds.view(
+            bs_embed * num_images_per_prompt, seq_len, -1
+        )
 
         # get unconditional embeddings for classifier free guidance
         if do_classifier_free_guidance and negative_prompt_embeds is None:
@@ -314,7 +367,10 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
                 return_tensors="pt",
             )
 
-            if hasattr(self.text_encoder.config, "use_attention_mask") and self.text_encoder.config.use_attention_mask:
+            if (
+                hasattr(self.text_encoder.config, "use_attention_mask")
+                and self.text_encoder.config.use_attention_mask
+            ):
                 attention_mask = uncond_input.attention_mask.to(device)
             else:
                 attention_mask = None
@@ -329,22 +385,37 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
             # duplicate unconditional embeddings for each generation per prompt, using mps friendly method
             seq_len = negative_prompt_embeds.shape[1]
 
-            negative_prompt_embeds = negative_prompt_embeds.to(dtype=prompt_embeds_dtype, device=device)
+            negative_prompt_embeds = negative_prompt_embeds.to(
+                dtype=prompt_embeds_dtype, device=device
+            )
 
-            negative_prompt_embeds = negative_prompt_embeds.repeat(1, num_images_per_prompt, 1)
-            negative_prompt_embeds = negative_prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
+            negative_prompt_embeds = negative_prompt_embeds.repeat(
+                1, num_images_per_prompt, 1
+            )
+            negative_prompt_embeds = negative_prompt_embeds.view(
+                batch_size * num_images_per_prompt, seq_len, -1
+            )
 
         return prompt_embeds, negative_prompt_embeds
 
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img.StableDiffusionImg2ImgPipeline.check_inputs
     def check_inputs(
-        self, prompt, strength, callback_steps, negative_prompt=None, prompt_embeds=None, negative_prompt_embeds=None
+        self,
+        prompt,
+        strength,
+        callback_steps,
+        negative_prompt=None,
+        prompt_embeds=None,
+        negative_prompt_embeds=None,
     ):
         if strength < 0 or strength > 1:
-            raise ValueError(f"The value of strength should in [0.0, 1.0] but is {strength}")
+            raise ValueError(
+                f"The value of strength should in [0.0, 1.0] but is {strength}"
+            )
 
         if (callback_steps is None) or (
-            callback_steps is not None and (not isinstance(callback_steps, int) or callback_steps <= 0)
+            callback_steps is not None
+            and (not isinstance(callback_steps, int) or callback_steps <= 0)
         ):
             raise ValueError(
                 f"`callback_steps` has to be a positive integer but is {callback_steps} of type"
@@ -360,8 +431,12 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
             raise ValueError(
                 "Provide either `prompt` or `prompt_embeds`. Cannot leave both `prompt` and `prompt_embeds` undefined."
             )
-        elif prompt is not None and (not isinstance(prompt, str) and not isinstance(prompt, list)):
-            raise ValueError(f"`prompt` has to be of type `str` or `list` but is {type(prompt)}")
+        elif prompt is not None and (
+            not isinstance(prompt, str) and not isinstance(prompt, list)
+        ):
+            raise ValueError(
+                f"`prompt` has to be of type `str` or `list` but is {type(prompt)}"
+            )
 
         if negative_prompt is not None and negative_prompt_embeds is not None:
             raise ValueError(
@@ -384,13 +459,17 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
         # eta corresponds to η in DDIM paper: https://arxiv.org/abs/2010.02502
         # and should be between [0, 1]
 
-        accepts_eta = "eta" in set(inspect.signature(self.scheduler.step).parameters.keys())
+        accepts_eta = "eta" in set(
+            inspect.signature(self.scheduler.step).parameters.keys()
+        )
         extra_step_kwargs = {}
         if accepts_eta:
             extra_step_kwargs["eta"] = eta
 
         # check if the scheduler accepts generator
-        accepts_generator = "generator" in set(inspect.signature(self.scheduler.step).parameters.keys())
+        accepts_generator = "generator" in set(
+            inspect.signature(self.scheduler.step).parameters.keys()
+        )
         if accepts_generator:
             extra_step_kwargs["generator"] = generator
         return extra_step_kwargs
@@ -401,10 +480,14 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
             has_nsfw_concept = None
         else:
             if torch.is_tensor(image):
-                feature_extractor_input = self.image_processor.postprocess(image, output_type="pil")
+                feature_extractor_input = self.image_processor.postprocess(
+                    image, output_type="pil"
+                )
             else:
                 feature_extractor_input = self.image_processor.numpy_to_pil(image)
-            safety_checker_input = self.feature_extractor(feature_extractor_input, return_tensors="pt").to(device)
+            safety_checker_input = self.feature_extractor(
+                feature_extractor_input, return_tensors="pt"
+            ).to(device)
             image, has_nsfw_concept = self.safety_checker(
                 images=image, clip_input=safety_checker_input.pixel_values.to(dtype)
             )
@@ -432,7 +515,17 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
 
         return timesteps, num_inference_steps - t_start
 
-    def prepare_latents(self, image, timestep, batch_size, num_images_per_prompt, dtype, device, denoise_model, generator=None):
+    def prepare_latents(
+        self,
+        image,
+        timestep,
+        batch_size,
+        num_images_per_prompt,
+        dtype,
+        device,
+        denoise_model,
+        generator=None,
+    ):
         image = image.to(device=device, dtype=dtype)
 
         batch_size = image.shape[0]
@@ -449,7 +542,8 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
 
             if isinstance(generator, list):
                 init_latents = [
-                    self.vae.encode(image[i : i + 1]).latent_dist.sample(generator[i]) for i in range(batch_size)
+                    self.vae.encode(image[i : i + 1]).latent_dist.sample(generator[i])
+                    for i in range(batch_size)
                 ]
                 init_latents = torch.cat(init_latents, dim=0)
             else:
@@ -457,7 +551,10 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
 
             init_latents = self.vae.config.scaling_factor * init_latents
 
-        if batch_size > init_latents.shape[0] and batch_size % init_latents.shape[0] == 0:
+        if (
+            batch_size > init_latents.shape[0]
+            and batch_size % init_latents.shape[0] == 0
+        ):
             # expand init_latents for batch_size
             deprecation_message = (
                 f"You have passed {batch_size} text prompts (`prompt`), but only {init_latents.shape[0]} initial"
@@ -465,10 +562,21 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
                 " that this behavior is deprecated and will be removed in a version 1.0.0. Please make sure to update"
                 " your script to pass as many initial images as text prompts to suppress this warning."
             )
-            deprecate("len(prompt) != len(image)", "1.0.0", deprecation_message, standard_warn=False)
+            deprecate(
+                "len(prompt) != len(image)",
+                "1.0.0",
+                deprecation_message,
+                standard_warn=False,
+            )
             additional_image_per_prompt = batch_size // init_latents.shape[0]
-            init_latents = torch.cat([init_latents] * additional_image_per_prompt * num_images_per_prompt, dim=0)
-        elif batch_size > init_latents.shape[0] and batch_size % init_latents.shape[0] != 0:
+            init_latents = torch.cat(
+                [init_latents] * additional_image_per_prompt * num_images_per_prompt,
+                dim=0,
+            )
+        elif (
+            batch_size > init_latents.shape[0]
+            and batch_size % init_latents.shape[0] != 0
+        ):
             raise ValueError(
                 f"Cannot duplicate `image` of batch size {init_latents.shape[0]} to {batch_size} text prompts."
             )
@@ -494,12 +602,12 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
         self,
         prompt: Union[str, List[str]],
         source_prompt: Union[str, List[str]],
-        negative_prompt: Union[str, List[str]]=None,
-        positive_prompt: Union[str, List[str]]=None,
+        negative_prompt: Union[str, List[str]] = None,
+        positive_prompt: Union[str, List[str]] = None,
         image: PipelineImageInput = None,
         strength: float = 0.8,
         num_inference_steps: Optional[int] = 50,
-        original_inference_steps: Optional[int]  = 50,
+        original_inference_steps: Optional[int] = 50,
         guidance_scale: Optional[float] = 7.5,
         source_guidance_scale: Optional[float] = 1,
         num_images_per_prompt: Optional[int] = 1,
@@ -526,7 +634,9 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
 
         # 3. Encode input prompt
         text_encoder_lora_scale = (
-            cross_attention_kwargs.get("scale", None) if cross_attention_kwargs is not None else None
+            cross_attention_kwargs.get("scale", None)
+            if cross_attention_kwargs is not None
+            else None
         )
         prompt_embeds_tuple = self.encode_prompt(
             prompt,
@@ -538,14 +648,21 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
             lora_scale=text_encoder_lora_scale,
         )
         source_prompt_embeds_tuple = self.encode_prompt(
-            source_prompt, device, num_images_per_prompt, do_classifier_free_guidance, positive_prompt, None
+            source_prompt,
+            device,
+            num_images_per_prompt,
+            do_classifier_free_guidance,
+            positive_prompt,
+            None,
         )
         if prompt_embeds_tuple[1] is not None:
             prompt_embeds = torch.cat([prompt_embeds_tuple[1], prompt_embeds_tuple[0]])
         else:
             prompt_embeds = prompt_embeds_tuple[0]
         if source_prompt_embeds_tuple[1] is not None:
-            source_prompt_embeds = torch.cat([source_prompt_embeds_tuple[1], source_prompt_embeds_tuple[0]])
+            source_prompt_embeds = torch.cat(
+                [source_prompt_embeds_tuple[1], source_prompt_embeds_tuple[0]]
+            )
         else:
             source_prompt_embeds = source_prompt_embeds_tuple[0]
 
@@ -554,15 +671,25 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
 
         # 5. Prepare timesteps
         self.scheduler.set_timesteps(
-          num_inference_steps=num_inference_steps, 
-          device=device, 
-          original_inference_steps=original_inference_steps)
-        timesteps, num_inference_steps = self.get_timesteps(num_inference_steps, strength, device)
+            num_inference_steps=num_inference_steps,
+            device=device,
+            original_inference_steps=original_inference_steps,
+        )
+        timesteps, num_inference_steps = self.get_timesteps(
+            num_inference_steps, strength, device
+        )
         latent_timestep = timesteps[:1].repeat(batch_size * num_images_per_prompt)
 
         # 6. Prepare latent variables
         latents, clean_latents = self.prepare_latents(
-            image, latent_timestep, batch_size, num_images_per_prompt, prompt_embeds.dtype, device, denoise_model, generator
+            image,
+            latent_timestep,
+            batch_size,
+            num_images_per_prompt,
+            prompt_embeds.dtype,
+            device,
+            denoise_model,
+            generator,
         )
         source_latents = latents
         mutual_latents = latents
@@ -573,19 +700,43 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
 
         # 8. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+
+
+        z_0_list = []
+        # 9. get multiple views for pano
+        height = 512
+        width = 4 * height
+        views_t = get_views(height, width)  # height = 512; width = 4*height = 2048
+        count_t = torch.zeros_like(latents)
+        value_t = torch.zeros_like(latents)
+        # latents are sampled from standard normal distribution (torch.randn()) with a size of Bx4x64x256,
+        # where B denotes the batch size.
+
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 # expand the latents if we are doing classifier free guidance
-                latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                latent_model_input = (
+                    torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                )
                 source_latent_model_input = (
-                    torch.cat([source_latents] * 2) if do_classifier_free_guidance else source_latents
+                    torch.cat([source_latents] * 2)
+                    if do_classifier_free_guidance
+                    else source_latents
                 )
                 mutual_latent_model_input = (
-                    torch.cat([mutual_latents] * 2) if do_classifier_free_guidance else mutual_latents
+                    torch.cat([mutual_latents] * 2)
+                    if do_classifier_free_guidance
+                    else mutual_latents
                 )
-                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
-                source_latent_model_input = self.scheduler.scale_model_input(source_latent_model_input, t)
-                mutual_latent_model_input = self.scheduler.scale_model_input(mutual_latent_model_input, t)
+                latent_model_input = self.scheduler.scale_model_input(
+                    latent_model_input, t
+                )
+                source_latent_model_input = self.scheduler.scale_model_input(
+                    source_latent_model_input, t
+                )
+                mutual_latent_model_input = self.scheduler.scale_model_input(
+                    mutual_latent_model_input, t
+                )
 
                 # predict the noise residual
                 if do_classifier_free_guidance:
@@ -644,52 +795,101 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
                         mutual_noise_pred_uncond,
                         source_noise_pred_text,
                         noise_pred_text,
-                        mutual_noise_pred_text
+                        mutual_noise_pred_text,
                     ) = concat_noise_pred.chunk(6, dim=0)
 
-                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-                    source_noise_pred = source_noise_pred_uncond + source_guidance_scale * (
-                        source_noise_pred_text - source_noise_pred_uncond
+                    noise_pred = noise_pred_uncond + guidance_scale * (
+                        noise_pred_text - noise_pred_uncond
                     )
-                    mutual_noise_pred = mutual_noise_pred_uncond + source_guidance_scale * (
-                        mutual_noise_pred_text - mutual_noise_pred_uncond
+                    source_noise_pred = (
+                        source_noise_pred_uncond
+                        + source_guidance_scale
+                        * (source_noise_pred_text - source_noise_pred_uncond)
+                    )
+                    mutual_noise_pred = (
+                        mutual_noise_pred_uncond
+                        + source_guidance_scale
+                        * (mutual_noise_pred_text - mutual_noise_pred_uncond)
                     )
 
                 else:
-                    (source_noise_pred, noise_pred, mutual_noise_pred) = concat_noise_pred.chunk(3, dim=0)
+                    (source_noise_pred, noise_pred, mutual_noise_pred) = (
+                        concat_noise_pred.chunk(3, dim=0)
+                    )
 
                 noise = torch.randn(
-                    latents.shape, dtype=latents.dtype, device=latents.device, generator=generator
+                    latents.shape,
+                    dtype=latents.dtype,
+                    device=latents.device,
+                    generator=generator,
                 )
 
                 _, latents, pred_x0 = ddcm_sampler(
-                  self.scheduler, source_latents, 
-                  latents, t, 
-                  source_noise_pred, noise_pred, 
-                  clean_latents, noise=noise, 
-                  eta=eta, to_next=False, 
-                  **extra_step_kwargs
+                    self.scheduler,
+                    source_latents,
+                    latents,
+                    t,
+                    source_noise_pred,
+                    noise_pred,
+                    clean_latents,
+                    noise=noise,
+                    eta=eta,
+                    to_next=False,
+                    timestep_idx=i,
+                    **extra_step_kwargs,
                 )
-                
+
                 source_latents, mutual_latents, pred_xm = ddcm_sampler(
-                  self.scheduler, source_latents, 
-                  mutual_latents, t, 
-                  source_noise_pred, mutual_noise_pred, 
-                  clean_latents, noise=noise, 
-                  eta=eta, **extra_step_kwargs
+                    self.scheduler,
+                    source_latents,
+                    mutual_latents,
+                    t,
+                    source_noise_pred,
+                    mutual_noise_pred,
+                    clean_latents,
+                    noise=noise,
+                    eta=eta,
+                    timestep_idx=i,
+                    **extra_step_kwargs,
                 )
 
                 # call the callback, if provided
-                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                if i == len(timesteps) - 1 or (
+                    (i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0
+                ):
                     progress_bar.update()
                     if callback is not None and i % callback_steps == 0:
                         alpha_prod_t = self.scheduler.alphas_cumprod[t]
-                        mutual_latents, latents = callback(i, t, source_latents, latents, mutual_latents, alpha_prod_t)
+                        mutual_latents, latents = callback(
+                            i, t, source_latents, latents, mutual_latents, alpha_prod_t
+                        )
+                z_0_list.append(pred_x0)
+
+        # 8.5 save z_0
+        # save_dir = os.path.join(os.getcwd(), "z_0_list")  # 保存目录
+        # z_0_loop = tqdm(enumerate(z_0_list))
+
+        # save_dir = os.path.join(save_dir, f"{prompt}_{source_prompt}".replace(" ", "_"))
+        # os.makedirs(save_dir, exist_ok=True)
+        # for idx, img in z_0_loop:
+        #     file_name = f"z_0_{idx}.png"
+        #     image = self.vae.decode(
+        #         img / self.vae.config.scaling_factor, return_dict=False
+        #     )[0]
+        #     do_denormalize = [True] * image.shape[0]
+        #     out_image = self.image_processor.postprocess(
+        #         image, output_type=output_type, do_denormalize=do_denormalize
+        #     )[0]
+        #     print(type(out_image))
+        #     # 保存图像
+        #     out_image.save(os.path.join(save_dir, file_name))
 
         # 9. Post-processing
         if not output_type == "latent":
-            image = self.vae.decode(pred_x0 / self.vae.config.scaling_factor, return_dict=False)[0]
-            image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
+            image = self.vae.decode(
+                pred_x0 / self.vae.config.scaling_factor, return_dict=False
+            )[0]
+            has_nsfw_concept = None
         else:
             image = pred_x0
             has_nsfw_concept = None
@@ -699,9 +899,13 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
         else:
             do_denormalize = [not has_nsfw for has_nsfw in has_nsfw_concept]
 
-        image = self.image_processor.postprocess(image, output_type=output_type, do_denormalize=do_denormalize)
+        image = self.image_processor.postprocess(
+            image, output_type=output_type, do_denormalize=do_denormalize
+        )
 
         if not return_dict:
             return (image, has_nsfw_concept)
 
-        return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
+        return StableDiffusionPipelineOutput(
+            images=image, nsfw_content_detected=has_nsfw_concept
+        )
