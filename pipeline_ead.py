@@ -1,11 +1,14 @@
 import inspect
-from typing import Any, Callable, Dict, List, Optional, Union
+import math
+from typing import Any, Callable, Dict, List, Optional, Union, Tuple
 import os
 import PIL.Image
+from einops import rearrange
 from tqdm import tqdm
 import numpy as np
 import PIL
 import torch
+import torch.nn.functional as F
 from packaging import version
 from transformers import CLIPImageProcessor, CLIPTextModel, CLIPTokenizer
 
@@ -22,6 +25,7 @@ from diffusers.pipelines.stable_diffusion import StableDiffusionPipelineOutput
 from diffusers.pipelines.stable_diffusion.safety_checker import (
     StableDiffusionSafetyChecker,
 )
+import ptp_utils
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -597,6 +601,8 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
 
         return latents, clean_latents
 
+    # TODO
+    # 1.
     @torch.no_grad()
     def __call__(
         self,
@@ -619,7 +625,11 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: int = 1,
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
-        denoise_model: Optional[bool] = True,
+        denoise: Optional[bool] = True,
+        latent_size: int = 64,
+        stride: int = 16,
+        height: int = 512,
+        width: int = 3072,
     ):
         # 1. Check inputs
         self.check_inputs(prompt, strength, callback_steps)
@@ -680,6 +690,11 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
         )
         latent_timestep = timesteps[:1].repeat(batch_size * num_images_per_prompt)
 
+        if denoise is False:
+            strength = 1
+        num_denoise_num = math.trunc(num_inference_steps * strength)
+        num_start = num_inference_steps - num_denoise_num
+
         # 6. Prepare latent variables
         latents, clean_latents = self.prepare_latents(
             image,
@@ -688,7 +703,7 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
             num_images_per_prompt,
             prompt_embeds.dtype,
             device,
-            denoise_model,
+            denoise,
             generator,
         )
         source_latents = latents
@@ -701,32 +716,73 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
         # 8. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
 
-
         z_0_list = []
         # 9. get multiple views for pano
-        height = 512
-        width = 4 * height
-        views_t = get_views(height, width)  # height = 512; width = 4*height = 2048
-        count_t = torch.zeros_like(latents)
-        value_t = torch.zeros_like(latents)
         # latents are sampled from standard normal distribution (torch.randn()) with a size of Bx4x64x256,
         # where B denotes the batch size.
+        mad_thereshold = 25
+        views = get_views(height, width, window_size=[latent_size] * 2, stride=stride)
+        count = torch.zeros_like(
+            latents, requires_grad=False, device=self.device, dtype=self.dtype
+        )
+        value = torch.zeros_like(
+            latents, requires_grad=False, device=self.device, dtype=self.dtype
+        )
+
+        # unet set
+        processor = AttnProcessor(
+            batch_size=6,
+            latent_h=height // 8,
+            views=views,
+            latent_w=width // 8,
+            stride=stride,
+            is_cons=False,
+            num_start=num_start,
+            num_steps=num_inference_steps,
+        )
+        self.unet.set_attn_processor(processor)
+        mad_blocks = "all"
+        self.set_attn_processor_mad(processor, mad_blocks)
 
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
+                if i >= mad_thereshold:
+                    pass
+                else:
+                    pass
+                batched_latent_views = []
+                batched_source_latent_views = []
+                batched_mutual_latent_views = []
+                batched_clean_latent_views = []
+                for view_idx, (h_start, h_end, w_start, w_end) in enumerate(views):
+                    latent_view = latents[:, :, h_start:h_end, w_start:w_end].detach()
+                    source_view = source_latents[
+                        :, :, h_start:h_end, w_start:w_end
+                    ].detach()
+                    mutual_view = mutual_latents[
+                        :, :, h_start:h_end, w_start:w_end
+                    ].detach()
+                    clean_view = clean_latents[:, :, h_start:h_end, w_start:w_end]
+                    batched_latent_views.append(latent_view)
+                    batched_source_latent_views.append(source_view)
+                    batched_mutual_latent_views.append(mutual_view)
+                    batched_clean_latent_views.append(clean_view)
+
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = (
-                    torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                    torch.cat(batched_latent_views * 2)
+                    if do_classifier_free_guidance
+                    else latents
                 )
                 source_latent_model_input = (
-                    torch.cat([source_latents] * 2)
+                    torch.cat(batched_source_latent_views * 2)
                     if do_classifier_free_guidance
-                    else source_latents
+                    else batched_source_latent_views
                 )
                 mutual_latent_model_input = (
-                    torch.cat([mutual_latents] * 2)
+                    torch.cat(batched_mutual_latent_views * 2)
                     if do_classifier_free_guidance
-                    else mutual_latents
+                    else batched_mutual_latent_views
                 )
                 latent_model_input = self.scheduler.scale_model_input(
                     latent_model_input, t
@@ -740,34 +796,34 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
 
                 # predict the noise residual
                 if do_classifier_free_guidance:
-                    concat_latent_model_input = torch.stack(
+                    concat_latent_model_input = torch.vstack(
                         [
-                            source_latent_model_input[0],
-                            latent_model_input[0],
-                            mutual_latent_model_input[0],
-                            source_latent_model_input[1],
-                            latent_model_input[1],
-                            mutual_latent_model_input[1],
+                            source_latent_model_input.chunk(2)[0],
+                            latent_model_input.chunk(2)[0],
+                            mutual_latent_model_input.chunk(2)[0],
+                            source_latent_model_input.chunk(2)[1],
+                            latent_model_input.chunk(2)[1],
+                            mutual_latent_model_input.chunk(2)[1],
                         ],
-                        dim=0,
+                        # dim=0,
                     )
-                    concat_prompt_embeds = torch.stack(
+                    concat_prompt_embeds = torch.vstack(
                         [
-                            source_prompt_embeds[0],
-                            prompt_embeds[0],
-                            source_prompt_embeds[0],
-                            source_prompt_embeds[1],
-                            prompt_embeds[1],
-                            source_prompt_embeds[1],
+                            source_prompt_embeds[0].repeat(len(views), 1, 1),
+                            prompt_embeds[0].repeat(len(views), 1, 1),
+                            source_prompt_embeds[0].repeat(len(views), 1, 1),
+                            source_prompt_embeds[1].repeat(len(views), 1, 1),
+                            prompt_embeds[1].repeat(len(views), 1, 1),
+                            source_prompt_embeds[1].repeat(len(views), 1, 1),
                         ],
-                        dim=0,
+                        # dim=0,
                     )
                 else:
                     concat_latent_model_input = torch.cat(
                         [
-                            source_latent_model_input,
-                            latent_model_input,
-                            mutual_latent_model_input,
+                            source_latent_model_input.repeat(len(views)),
+                            latent_model_input.repeat(len(views)),
+                            mutual_latent_model_input.repeat(len(views)),
                         ],
                         dim=0,
                     )
@@ -818,20 +874,20 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
                     )
 
                 noise = torch.randn(
-                    latents.shape,
+                    noise_pred.shape,
                     dtype=latents.dtype,
                     device=latents.device,
                     generator=generator,
                 )
 
-                _, latents, pred_x0 = ddcm_sampler(
+                _, latent_view_dn, pred_x0_view_dn = ddcm_sampler(
                     self.scheduler,
-                    source_latents,
-                    latents,
+                    torch.vstack(batched_source_latent_views),
+                    torch.vstack(batched_latent_views),
                     t,
                     source_noise_pred,
                     noise_pred,
-                    clean_latents,
+                    torch.vstack(batched_clean_latent_views),
                     noise=noise,
                     eta=eta,
                     to_next=False,
@@ -839,19 +895,62 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
                     **extra_step_kwargs,
                 )
 
-                source_latents, mutual_latents, pred_xm = ddcm_sampler(
+                source_latents_view_dn, mutual_latents_view_dn, pred_xm = ddcm_sampler(
                     self.scheduler,
-                    source_latents,
-                    mutual_latents,
+                    torch.vstack(batched_source_latent_views),
+                    torch.vstack(batched_mutual_latent_views),
                     t,
                     source_noise_pred,
                     mutual_noise_pred,
-                    clean_latents,
+                    torch.vstack(batched_clean_latent_views),
                     noise=noise,
                     eta=eta,
                     timestep_idx=i,
                     **extra_step_kwargs,
                 )
+
+                # -----------------------------------------------------------------------------
+                # TODO
+                # need to be optimized
+                for view_idx, (h_start, h_end, w_start, w_end) in enumerate(views):
+                    value[:, :, h_start:h_end, w_start:w_end] += latent_view_dn[
+                        view_idx
+                    ]
+                    count[:, :, h_start:h_end, w_start:w_end] += 1
+
+                # take the MultiDiffusion step (average the latents)
+                latents = torch.where(count > 0, value / count, value)
+
+                count.zero_()
+                value.zero_()
+                for view_idx, (h_start, h_end, w_start, w_end) in enumerate(views):
+                    value[:, :, h_start:h_end, w_start:w_end] += pred_x0_view_dn[
+                        view_idx
+                    ]
+                    count[:, :, h_start:h_end, w_start:w_end] += 1
+                pred_x0 = torch.where(count > 0, value / count, value)
+                count.zero_()
+                value.zero_()
+
+                for view_idx, (h_start, h_end, w_start, w_end) in enumerate(views):
+                    value[:, :, h_start:h_end, w_start:w_end] += source_latents_view_dn[
+                        view_idx
+                    ]
+                    count[:, :, h_start:h_end, w_start:w_end] += 1
+                source_latents = torch.where(count > 0, value / count, value)
+                count.zero_()
+                value.zero_()
+
+                for view_idx, (h_start, h_end, w_start, w_end) in enumerate(views):
+                    value[:, :, h_start:h_end, w_start:w_end] += mutual_latents_view_dn[
+                        view_idx
+                    ]
+                    count[:, :, h_start:h_end, w_start:w_end] += 1
+                mutual_latents = torch.where(count > 0, value / count, value)
+                count.zero_()
+                value.zero_()
+
+                # -----------------------------------------------------------------------------
 
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or (
@@ -860,9 +959,9 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
                     progress_bar.update()
                     if callback is not None and i % callback_steps == 0:
                         alpha_prod_t = self.scheduler.alphas_cumprod[t]
-                        mutual_latents, latents = callback(
-                            i, t, source_latents, latents, mutual_latents, alpha_prod_t
-                        )
+                        # mutual_latents, latents = callback(
+                        #     i, t, source_latents, latents, mutual_latents, alpha_prod_t
+                        # )
                 z_0_list.append(pred_x0)
 
         # 8.5 save z_0
@@ -909,3 +1008,404 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
         return StableDiffusionPipelineOutput(
             images=image, nsfw_content_detected=has_nsfw_concept
         )
+
+    def set_attn_processor_mad(self, processor, block_name="all"):
+        def fn_recursive_attn_processor(
+            name: str, module: torch.nn.Module, processor, place_in_unet="nothing"
+        ):
+            """
+            Recursively traverse the module and set the apply_mad attribute of the AttentionRefine processor.
+
+            Args:
+                name (str): The name of the module.
+                module (torch.nn.Module): The module to traverse.
+                processor (AttentionRefine or dict of AttentionRefine): The processor to set. If a dict, it must contain the processor for each place_in_unet.
+                place_in_unet (str, optional): The place in the U-Net to set the processor. Defaults to 'nothing'.
+            """
+            if hasattr(module, "set_processor"):
+                if not isinstance(processor, dict):
+                    module.processor.apply_mad = True
+                    module.processor.place_in_unet = place_in_unet
+                else:
+                    raise NotImplementedError
+
+            for sub_name, child in module.named_children():
+                fn_recursive_attn_processor(
+                    f"{name}.{sub_name}", child, processor, place_in_unet=place_in_unet
+                )
+
+        if "down_blocks" in block_name:
+            for name, module in self.unet.down_blocks.named_children():
+                fn_recursive_attn_processor(
+                    name, module, processor, place_in_unet="down"
+                )
+        elif "mid_block" in block_name:
+            for name, module in self.unet.mid_block.named_children():
+                fn_recursive_attn_processor(
+                    name, module, processor, place_in_unet="mid"
+                )
+        elif "up_blocks" in block_name:
+            for name, module in self.unet.up_blocks.named_children():
+                fn_recursive_attn_processor(name, module, processor, place_in_unet="up")
+        else:
+            for name, module in self.unet.named_children():
+                fn_recursive_attn_processor(name, module, processor)
+
+
+class AttnProcessor:
+    """
+    Cross frame attention processor with scaled_dot_product attention of Pytorch 2.0.
+    """
+
+    def __init__(
+        self,
+        latent_h,
+        latent_w,
+        views,
+        batch_size=1,
+        stride=16,
+        latent_size=64,
+        mad=False,
+        is_cons=False,
+        self_replace_steps=0.7,
+        num_start=0.3,
+        start_steps=0,
+        num_steps=10,
+    ):
+        if not hasattr(F, "scaled_dot_product_attention"):
+            raise ImportError(
+                "AttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0."
+            )
+
+        self.latent_h = latent_h
+        self.latent_w = latent_w
+        self.views = views
+        self.bs = batch_size
+        self.stride = stride
+        self.mad = mad
+        self.is_cons = is_cons
+        self.latent_size = latent_size
+        self.place_in_unet = "nothing"
+        self.self_replace_steps = self_replace_steps
+        self.num_start = num_start
+        self.start_steps = start_steps
+        self.cur_step = 0
+        self.num_steps = num_steps
+
+    def compute_current_sizes(self, batch):
+        bs, sequence_length, inner_dim = batch.shape
+        views_len = bs // self.bs
+        spatial_size = int(math.sqrt(sequence_length))
+        down_factor = self.latent_size // spatial_size
+        latent_h = self.latent_h // down_factor
+        latent_w = self.latent_w // down_factor
+        return views_len, spatial_size, down_factor, latent_h, latent_w, inner_dim
+
+    def merge_all_batched_qkv_views_into_canvas(self, batch_q, batch_k, batch_v):
+        views_len, spatial_size, down_factor, latent_h, latent_w, inner_dim = (
+            self.compute_current_sizes(batch_q)
+        )
+        batch_q_views = rearrange(
+            batch_q, "(b v) (h w) d -> b v d h w", v=views_len, h=spatial_size
+        )
+        batch_k_views = rearrange(
+            batch_k, "(b v) (h w) d -> b v d h w", v=views_len, h=spatial_size
+        )
+        batch_v_views = rearrange(
+            batch_v, "(b v) (h w) d -> b v d h w", v=views_len, h=spatial_size
+        )
+        canvas_q = torch.zeros(
+            (self.bs, inner_dim, latent_h, latent_w),
+            device=self.device,
+            dtype=self.dtype,
+        )
+        canvas_k = torch.zeros(
+            (self.bs, inner_dim, latent_h, latent_w),
+            device=self.device,
+            dtype=self.dtype,
+        )
+        canvas_v = torch.zeros(
+            (self.bs, inner_dim, latent_h, latent_w),
+            device=self.device,
+            dtype=self.dtype,
+        )
+        count = torch.zeros(
+            (self.bs, inner_dim, latent_h, latent_w),
+            device=self.device,
+            dtype=self.dtype,
+        )
+        for view_idx, (h_start, h_end, w_start, w_end) in enumerate(self.views):
+            h_start, h_end = h_start // down_factor, h_end // down_factor
+            w_start, w_end = w_start // down_factor, w_end // down_factor
+            canvas_q[:, :, h_start:h_end, w_start:w_end] += batch_q_views[:, view_idx]
+            canvas_k[:, :, h_start:h_end, w_start:w_end] += batch_k_views[:, view_idx]
+            canvas_v[:, :, h_start:h_end, w_start:w_end] += batch_v_views[:, view_idx]
+            count[:, :, h_start:h_end, w_start:w_end] += 1
+        batch_q = torch.where(count > 0, canvas_q / count, canvas_q)
+        batch_k = torch.where(count > 0, canvas_k / count, canvas_k)
+        batch_v = torch.where(count > 0, canvas_v / count, canvas_v)
+        return batch_q, batch_k, batch_v, down_factor
+
+    def merge_batched_q_views_into_canvas(self, batch):
+        views_len, spatial_size, down_factor, latent_h, latent_w, inner_dim = (
+            self.compute_current_sizes(batch)
+        )
+        batch_views = rearrange(
+            batch, "(b v) (h w) d -> b v d h w", v=views_len, h=spatial_size
+        )
+        canvas = torch.zeros(
+            (self.bs, inner_dim, latent_h, latent_w),
+            device=self.device,
+            dtype=self.dtype,
+        )
+        count = torch.zeros(
+            (self.bs, inner_dim, latent_h, latent_w),
+            device=self.device,
+            dtype=self.dtype,
+        )
+        for view_idx, (h_start, h_end, w_start, w_end) in enumerate(self.views):
+            h_start, h_end = h_start // down_factor, h_end // down_factor
+            w_start, w_end = w_start // down_factor, w_end // down_factor
+            canvas[:, :, h_start:h_end, w_start:w_end] += batch_views[:, view_idx]
+            count[:, :, h_start:h_end, w_start:w_end] += 1
+        batch = torch.where(count > 0, canvas / count, canvas)
+        return batch, down_factor
+
+    def split_canvas_into_views(self, canvas, down_factor):
+        canvas_views = []
+        for view_idx, (h_start, h_end, w_start, w_end) in enumerate(self.views):
+            h_start, h_end = h_start // down_factor, h_end // down_factor
+            w_start, w_end = w_start // down_factor, w_end // down_factor
+            canvas_views.append(canvas[:, :, h_start:h_end, w_start:w_end, :])
+        canvas = torch.cat(canvas_views, dim=1)
+        canvas = rearrange(canvas, "b v h w d -> (b v) (h w) d")
+        return canvas
+
+    def __call__(
+        self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None
+    ):
+        batch_size, sequence_length, _ = (
+            hidden_states.shape
+            if encoder_hidden_states is None
+            else encoder_hidden_states.shape
+        )
+
+        residual = hidden_states
+        inner_dim = hidden_states.shape[-1]
+        input_ndim = hidden_states.ndim
+        self.device = hidden_states.device
+        self.dtype = hidden_states.dtype
+        if input_ndim == 4:
+            batch_size, channel, height, width = hidden_states.shape
+            hidden_states = hidden_states.view(
+                batch_size, channel, height * width
+            ).transpose(1, 2)
+
+        if attention_mask is not None:
+            attention_mask = attn.prepare_attention_mask(
+                attention_mask, sequence_length, batch_size
+            )
+            attention_mask = attention_mask.view(
+                batch_size, attn.heads, -1, attention_mask.shape[-1]
+            )
+
+        is_cross_attention = encoder_hidden_states is not None
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+        elif attn.norm_cross:
+            encoder_hidden_states = attn.norm_encoder_hidden_states(
+                encoder_hidden_states
+            )
+
+        query = attn.to_q(hidden_states)
+        key = attn.to_k(encoder_hidden_states)
+        value = attn.to_v(encoder_hidden_states)
+        head_dim = inner_dim // attn.heads
+        query = attn.head_to_batch_dim(query)
+        key = attn.head_to_batch_dim(key)
+        value = attn.head_to_batch_dim(value)
+
+        if not is_cross_attention:
+            query, key, value = self.self_attn_forward(
+                query, key, value, attn.heads, bs=5
+            )
+            query = attn.batch_to_head_dim(query)
+            key = attn.batch_to_head_dim(key)
+            value = attn.batch_to_head_dim(value)
+            print(f'query.shape={query.shape}, key.shape={key.shape}, value.shape={value.shape}')
+            if self.apply_mad:
+                query, key, value, down_factor = (
+                    self.merge_all_batched_qkv_views_into_canvas(query, key, value)
+                )
+                print(f'query.shape={query.shape}, key.shape={key.shape}, value.shape={value.shape}')
+                query = rearrange(
+                    query, "b (nh hd) h w -> b nh (h w) hd", nh=attn.heads, hd=head_dim
+                ).contiguous()
+                key = rearrange(
+                    key, "b (nh hd) h w -> b nh (h w) hd", nh=attn.heads, hd=head_dim
+                ).contiguous()
+                value = rearrange(
+                    value, "b (nh hd) h w -> b nh (h w) hd", nh=attn.heads, hd=head_dim
+                ).contiguous()
+            else:
+                query = rearrange(
+                    query, "b hw (nh nd) -> b nh hw nd", nh=attn.heads, nd=head_dim
+                )
+                key = rearrange(
+                    key, "b hw (nh nd) -> b nh hw nd", nh=attn.heads, nd=head_dim
+                )
+                value = rearrange(
+                    value, "b hw (nh nd) -> b nh hw nd", nh=attn.heads, nd=head_dim
+                )
+        print(f'query,shape={query.shape},key,shape={key.shape},value,shape={value.shape}')
+        _query = rearrange(query, 'b nh hw nd -> (b nh) hw nd', nh=attn.heads)
+        _key = rearrange(key, 'b nh hw nd -> (b nh) hw nd', nh=attn.heads)
+        print(f'_query,shape={_query.shape},_key,shape={_key.shape}')
+        head_query = attn.head_to_batch_dim(_query)
+        head_key = attn.head_to_batch_dim(_key)
+        print(f'head_query,shape={head_query.shape},head_key,shape={head_key.shape}')
+        exit(-1)
+        attention_probs = attn.get_attention_scores(
+            head_query, head_key, attention_mask
+        )
+        if is_cross_attention:
+            print('cross attention')
+            query = rearrange(query, "(b n) h w -> b h (n w)", n=attn.heads)
+            key = rearrange(key, "(b n) h w -> b h (n w)", n=attn.heads)
+            value = rearrange(value, "(b n) h w -> b h (n w)", n=attn.heads)
+            query, down_factor = self.merge_batched_q_views_into_canvas(query)
+            query = rearrange(
+                query, "b (nh hd) h w -> b nh (h w) hd", nh=attn.heads, hd=head_dim
+            )
+            key = key[: self.bs]
+            key = rearrange(key, "b p (nh nd) -> b nh p nd", nh=attn.heads, nd=head_dim)
+            value = value[: self.bs]
+            value = rearrange(
+                value, "b p (nh nd) -> b nh p nd", nh=attn.heads, nd=head_dim
+            )
+
+            head_query = attn.head_to_batch_dim(query)
+            head_key = attn.head_to_batch_dim(key)
+            attention_probs = self.cross_attn_forward(
+                attention_probs, is_cross_attention, self.place_in_unet
+            )
+        # the output of sdp = (batch, num_heads, seq_len, head_dim)
+        hidden_states = torch.bmm(attention_probs, value)
+        hidden_states = attn.batch_to_head_dim(hidden_states)
+        # hidden_states = F.scaled_dot_product_attention(
+        #     query,
+        #     key,
+        #     value,
+        #     attn_mask=attention_mask,
+        #     dropout_p=0.0,
+        #     is_causal=False,
+        #     scale=attn.scale,
+        # )
+        if not is_cross_attention and not self.apply_mad:
+            hidden_states = rearrange(hidden_states, "b nh hw nd -> b hw (nh nd)")
+        else:
+            hidden_states = hidden_states.transpose(1, 2)
+            latent_h = self.latent_h // down_factor
+            hidden_states = rearrange(
+                hidden_states, "b (h w) nh hd -> b 1 h w (nh hd)", h=latent_h
+            )
+            hidden_states = self.split_canvas_into_views(hidden_states, down_factor)
+
+        hidden_states = hidden_states.to(query.dtype)
+        # linear proj
+        hidden_states = attn.to_out[0](hidden_states)
+        # dropout
+        hidden_states = attn.to_out[1](hidden_states)
+
+        if input_ndim == 4:
+            hidden_states = hidden_states.transpose(-1, -2).reshape(
+                batch_size, channel, height, width
+            )
+
+        if attn.residual_connection:
+            hidden_states = hidden_states + residual
+
+        hidden_states = hidden_states / attn.rescale_output_factor
+        self.cur_att_layer = 0
+        self.cur_step += 1
+        return hidden_states
+
+    def self_attn_forward(self, q, k, v, num_heads, bs):
+        num_heads *= bs
+        if q.shape[0] // num_heads == 3:
+            qs = list(q.chunk(q.shape[0] // self.bs))
+            ks = list(k.chunk(k.shape[0] // self.bs))
+            vs = list(v.chunk(v.shape[0] // self.bs))
+            if self.self_replace_steps <= (
+                (self.cur_step + self.start_steps + 1) * 1.0 / self.num_steps
+            ):
+                for i in range(len(qs)):
+                    qs[i] = torch.cat(
+                        [qs[i][: num_heads * 2], qs[i][num_heads : num_heads * 2]]
+                    )
+                    ks[i] = torch.cat([ks[i][: num_heads * 2], ks[i][:num_heads]])
+                    vs[i] = torch.cat([vs[i][: num_heads * 2], vs[i][:num_heads]])
+            else:
+                for i in range(len(qs)):
+                    qs[i] = torch.cat(
+                        [qs[i][:num_heads], qs[i][:num_heads], qs[i][:num_heads]]
+                    )
+                    ks[i] = torch.cat(
+                        [ks[i][:num_heads], ks[i][:num_heads], ks[i][:num_heads]]
+                    )
+                    vs[i] = torch.cat([vs[i][: num_heads * 2], vs[i][:num_heads]])
+            q, k, v = torch.cat(qs), torch.cat(ks), torch.cat(vs)
+            return q, k, v
+        else:
+            qu, qc = q.chunk(2)
+            ku, kc = k.chunk(2)
+            vu, vc = v.chunk(2)
+            if self.self_replace_steps <= (
+                (self.cur_step + self.start_steps + 1) * 1.0 / self.num_steps
+            ):
+                qu = torch.cat([qu[: num_heads * 2], qu[num_heads : num_heads * 2]])
+                qc = torch.cat([qc[: num_heads * 2], qc[num_heads : num_heads * 2]])
+                ku = torch.cat([ku[: num_heads * 2], ku[:num_heads]])
+                kc = torch.cat([kc[: num_heads * 2], kc[:num_heads]])
+                vu = torch.cat([vu[: num_heads * 2], vu[:num_heads]])
+                vc = torch.cat([vc[: num_heads * 2], vc[:num_heads]])
+            else:
+                qu = torch.cat([qu[:num_heads], qu[:num_heads], qu[:num_heads]])
+                qc = torch.cat([qc[:num_heads], qc[:num_heads], qc[:num_heads]])
+                ku = torch.cat([ku[:num_heads], ku[:num_heads], ku[:num_heads]])
+                kc = torch.cat([kc[:num_heads], kc[:num_heads], kc[:num_heads]])
+                vu = torch.cat([vu[: num_heads * 2], vu[:num_heads]])
+                vc = torch.cat([vc[: num_heads * 2], vc[:num_heads]])
+
+            return (
+                torch.cat([qu, qc], dim=0),
+                torch.cat([ku, kc], dim=0),
+                torch.cat([vu, vc], dim=0),
+            )
+
+    def cross_attn_forward(self, attn, is_cross: bool, place_in_unet: str):
+        if is_cross:
+            h = attn.shape[0] // self.bs
+            attn = attn.reshape(self.bs, h, *attn.shape[1:])
+            attn_base, attn_replace, attn_masa = attn[0], attn[1], attn[2]
+            attn_replace_new = self.replace_cross_attention(attn_masa, attn_replace)
+            attn_base_store = self.replace_cross_attention(attn_base, attn_replace)
+            if self.cross_replace_steps >= (
+                (self.cur_step + self.start_steps + 1) * 1.0 / self.num_steps
+            ):
+                attn[1] = attn_base_store
+            attn_store = torch.cat([attn_base_store, attn_replace_new])
+            attn = attn.reshape(self.batch_size * h, *attn.shape[2:])
+            attn_store = attn_store.reshape(2 * h, *attn_store.shape[2:])
+            self.store_attention(attn_store, is_cross, place_in_unet)
+        return attn
+
+    def replace_cross_attention(self, attn_base, att_replace):
+        if self.mapper_type == "replace":
+            return torch.einsum("hpw,bwn->bhpn", attn_base, self.mapper)
+        elif self.mapper_type == "refine":
+            attn_masa_replace = attn_base[:, :, self.mapper].squeeze()
+            attn_replace = attn_masa_replace * self.alphas + att_replace * (
+                1 - self.alphas
+            )
+            return attn_replace

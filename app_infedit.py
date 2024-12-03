@@ -1,4 +1,5 @@
 from diffusers import LCMScheduler
+from einops import rearrange
 from pipeline_ead import EditPipeline
 import os
 import gradio as gr
@@ -56,7 +57,6 @@ if torch.cuda.is_available():
 
 
 class LocalBlend:
-
     def get_mask(self, x_t, maps, word_idx, thresh, i):
         maps = maps * word_idx.reshape(1, 1, 1, 1, -1)
         maps = (maps[:, :, :, :, 1 : self.len - 1]).mean(0, keepdim=True)
@@ -142,7 +142,6 @@ class LocalBlend:
 
 
 class AttentionControl(abc.ABC):
-
     def step_callback(self, x_t):
         return x_t
 
@@ -182,7 +181,6 @@ class AttentionControl(abc.ABC):
 
 
 class EmptyControl(AttentionControl):
-
     def forward(self, attn, is_cross: bool, place_in_unet: str):
         return attn
 
@@ -195,7 +193,6 @@ class EmptyControl(AttentionControl):
 
 
 class AttentionStore(AttentionControl):
-
     @staticmethod
     def get_empty_store():
         return {
@@ -241,7 +238,6 @@ class AttentionStore(AttentionControl):
 
 
 class AttentionControlEdit(AttentionStore, abc.ABC):
-
     def step_callback(self, i, t, x_s, x_t, x_m, alpha_prod):
         if (self.local_blend is not None) and (i > 0):
             use_xm = self.cur_step + self.start_steps + 1 == self.num_steps
@@ -350,7 +346,6 @@ class AttentionControlEdit(AttentionStore, abc.ABC):
 
 
 class AttentionReplace(AttentionControlEdit):
-
     def replace_cross_attention(self, attn_base, att_replace):
         return torch.einsum("hpw,bwn->bhpn", attn_base, self.mapper)
 
@@ -373,7 +368,6 @@ class AttentionReplace(AttentionControlEdit):
 
 
 class AttentionRefine(AttentionControlEdit):
-
     def replace_cross_attention(self, attn_masa, att_replace):
         attn_masa_replace = attn_masa[:, :, self.mapper].squeeze()
         attn_replace = attn_masa_replace * self.alphas + att_replace * (1 - self.alphas)
@@ -466,8 +460,11 @@ def inference(
         self_replace_steps = replace_steps
 
     torch.manual_seed(seed)
-    ratio = min(height / img.height, width / img.width)
-    img = img.resize((int(img.width * ratio), int(img.height * ratio)))
+    
+    # do not resize it!!!
+    # ratio = min(height / img.height, width / img.width)
+    # img = img.resize((int(img.width * ratio), int(img.height * ratio)))
+    width, height = img.size   # haha, any size
     if denoise is False:
         strength = 1
     num_denoise_num = math.trunc(num_inference_steps * strength)
@@ -498,6 +495,8 @@ def inference(
         source_guidance_scale=guidance_s,
         denoise_model=denoise,
         callback=controller.step_callback,
+        height=height,
+        width=width,
     )
 
     return results.images[0]
@@ -626,16 +625,13 @@ with gr.Blocks(css=css) as demo:
         """
         )
     with gr.Row():
-
         with gr.Column(scale=55):
             with gr.Group():
-
                 img = gr.Image(label="Input image", height=512, type="pil")
 
                 image_out = gr.Image(label="Output image", height=512)
 
         with gr.Column(scale=45):
-
             with gr.Tab("UAC options"):
                 with gr.Group():
                     with gr.Row():
@@ -722,10 +718,10 @@ with gr.Blocks(css=css) as demo:
                             step=1,
                         )
                         width = gr.Slider(
-                            label="Width", value=512, minimum=512, maximum=1024, step=8
+                            label="Width", value=1024, minimum=512, maximum=3072, step=8
                         )
                         height = gr.Slider(
-                            label="Height", value=512, minimum=512, maximum=1024, step=8
+                            label="Height", value=512, minimum=512, maximum=5000, step=8
                         )
                     with gr.Row():
                         seed = gr.Slider(0, 2147483647, label="Seed", value=0, step=1)
