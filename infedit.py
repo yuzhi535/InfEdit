@@ -138,75 +138,105 @@ class LocalBlend:
         self.len = len
 
 
-class UnifiedAttentionControl:
-    def __init__(
-        self,
-        prompts,
-        num_steps: int,
-        start_steps: int = 0,
-        cross_replace_steps: Union[
-            float, Tuple[float, float], Dict[str, Tuple[float, float]]
-        ] = 0.0,
-        self_replace_steps: Union[float, Tuple[float, float]] = 0.0,
-        local_blend: Optional[LocalBlend] = None,
-        mapper_type: str = "refine",
-        prompt_specifiers=None,
-    ):
-        """
-        Unified interface for attention control.
+class AttentionControl(abc.ABC):
+    def step_callback(self, x_t):
+        return x_t
 
-        Args:
-            prompts (List[str]): A list of prompts for editing.
-            num_steps (int): The number of steps for the editing process.
-            start_steps (int, optional): The starting step for the editing process.
-                Defaults to 0.
-            cross_replace_steps (Union[float, Tuple[float, float], Dict[str, Tuple[float, float]]], optional):
-                The steps for cross-replacing attention. Defaults to 0.0.
-            self_replace_steps (Union[float, Tuple[float, float]], optional):
-                The steps for self-replacing attention. Defaults to 0.0.
-            local_blend (Optional[LocalBlend], optional): The local blending module.
-                Defaults to None.
-            mapper_type (str, optional): The type of the mapper. Defaults to "replace".
-            prompt_specifiers (List[str], optional): The prompt specifiers for refinement mapper.
-                Defaults to None.
-        """
+    def between_steps(self):
+        return
+
+    @property
+    def num_uncond_att_layers(self):
+        return self.num_att_layers if LOW_RESOURCE else 0
+
+    @abc.abstractmethod
+    def forward(self, attn, is_cross: bool, place_in_unet: str):
+        raise NotImplementedError
+
+    def __call__(self, attn, is_cross: bool, place_in_unet: str):
+        if self.cur_att_layer >= self.num_uncond_att_layers:
+            if LOW_RESOURCE:
+                attn = self.forward(attn, is_cross, place_in_unet)
+            else:
+                h = attn.shape[0]
+                attn[h // 2 :] = self.forward(attn[h // 2 :], is_cross, place_in_unet)
+        self.cur_att_layer += 1
+        if self.cur_att_layer == self.num_att_layers // 2 + self.num_uncond_att_layers:
+            self.cur_att_layer = 0
+            self.cur_step += 1
+            self.between_steps()
+        return attn
+
+    def reset(self):
+        self.cur_step = 0
+        self.cur_att_layer = 0
+
+    def __init__(self):
         self.cur_step = 0
         self.num_att_layers = -1
         self.cur_att_layer = 0
-        self.batch_size = len(prompts) + 1
-        self.self_replace_steps = self_replace_steps
-        self.cross_replace_steps = cross_replace_steps
-        self.num_steps = num_steps
-        self.start_steps = start_steps
-        self.local_blend = local_blend
+
+
+class EmptyControl(AttentionControl):
+    def forward(self, attn, is_cross: bool, place_in_unet: str):
+        return attn
+
+    def self_attn_forward(
+        self, q, k, v, sim, attn, is_cross, place_in_unet, num_heads, **kwargs
+    ):
+        b = q.shape[0] // num_heads
+        out = torch.einsum("h i j, h j d -> h i d", attn, v)
+        return out
+
+
+class AttentionStore(AttentionControl):
+    @staticmethod
+    def get_empty_store():
+        return {
+            "down_cross": [],
+            "mid_cross": [],
+            "up_cross": [],
+            "down_self": [],
+            "mid_self": [],
+            "up_self": [],
+        }
+
+    def forward(self, attn, is_cross: bool, place_in_unet: str):
+        key = f"{place_in_unet}_{'cross' if is_cross else 'self'}"
+        # for k, v in self.step_store.items():
+            # print(f"k: len(v) = {k}: {len(v)}")
+        if attn.shape[1] <= 32**2:  # avoid memory overhead
+            self.step_store[key].append(attn)
+        return attn
+
+    def between_steps(self):
+        if len(self.attention_store) == 0:
+            self.attention_store = self.step_store
+        else:
+            for key in self.attention_store:
+                for i in range(len(self.attention_store[key])):
+                    self.attention_store[key][i] += self.step_store[key][i]
+        self.step_store = self.get_empty_store()
+
+    def get_average_attention(self):
+        average_attention = {
+            key: [item / self.cur_step for item in self.attention_store[key]]
+            for key in self.attention_store
+        }
+        return average_attention
+
+    def reset(self):
+        super(AttentionStore, self).reset()
+        self.step_store = self.get_empty_store()
         self.attention_store = {}
-        self.mapper_type = mapper_type
-        self.mapper = None
-        self.alphas = None
 
-        if mapper_type == "replace":
-            self.mapper = (
-                seq_aligner.get_replacement_mapper(prompts, tokenizer)
-                .to(device)
-                .to(torch_dtype)
-            )
-        elif mapper_type == "refine":
-            self.mapper, alphas, ms, alpha_e, alpha_m = seq_aligner.get_refinement_mapper(
-                prompts, prompt_specifiers, tokenizer, encoder, device
-            )
-            self.mapper, alphas, ms = (
-                self.mapper.to(device),
-                alphas.to(device).to(torch_dtype),
-                ms.to(device).to(torch_dtype),
-            )
-            self.alphas = alphas.reshape(alphas.shape[0], 1, 1, alphas.shape[1])
-            self.ms = ms.reshape(ms.shape[0], 1, 1, ms.shape[1])
-            ms = ms.to(device)
-            alpha_e = alpha_e.to(device)
-            alpha_m = alpha_m.to(device)
-            t_len = len(tokenizer(prompts[1])["input_ids"])
-            self.local_blend.set_map(ms, alphas, alpha_e, alpha_m, t_len)
+    def __init__(self):
+        super(AttentionStore, self).__init__()
+        self.step_store = self.get_empty_store()
+        self.attention_store = {}
 
+
+class AttentionControlEdit(AttentionStore, abc.ABC):
     def step_callback(self, i, t, x_s, x_t, x_m, alpha_prod):
         if (self.local_blend is not None) and (i > 0):
             use_xm = self.cur_step + self.start_steps + 1 == self.num_steps
@@ -215,43 +245,52 @@ class UnifiedAttentionControl:
             )
         return x_m, x_t
 
-    def forward(self, attn, is_cross: bool, place_in_unet: str):
-        if is_cross:
-            h = attn.shape[0] // self.batch_size
-            attn = attn.reshape(self.batch_size, h, *attn.shape[1:])
-            attn_base, attn_replace, attn_masa = attn[0], attn[1], attn[2]
-            attn_replace_new = self.replace_cross_attention(attn_masa, attn_replace)
-            attn_base_store = self.replace_cross_attention(attn_base, attn_replace)
-            if self.cross_replace_steps >= (
-                (self.cur_step + self.start_steps + 1) * 1.0 / self.num_steps
-            ):
-                attn[1] = attn_base_store
-            attn_store = torch.cat([attn_base_store, attn_replace_new])
-            attn = attn.reshape(self.batch_size * h, *attn.shape[2:])
-            attn_store = attn_store.reshape(2 * h, *attn_store.shape[2:])
-            self.store_attention(attn_store, is_cross, place_in_unet)
-        return attn
+    def replace_self_attention(self, attn_base, att_replace):
+        if att_replace.shape[2] <= 16**2:
+            return attn_base.unsqueeze(0).expand(att_replace.shape[0], *attn_base.shape)
+        else:
+            return att_replace
 
+    @abc.abstractmethod
     def replace_cross_attention(self, attn_base, att_replace):
-        if self.mapper_type == "replace":
-            return torch.einsum("hpw,bwn->bhpn", attn_base, self.mapper)
-        elif self.mapper_type == "refine":
-            attn_masa_replace = attn_base[:, :, self.mapper].squeeze()
-            attn_replace = attn_masa_replace * self.alphas + att_replace * (1 - self.alphas)
-            return attn_replace
+        raise NotImplementedError
 
-    def self_attn_forward(self, q, k, v, num_heads):
+    def attn_batch(
+        self, q, k, v, sim, attn, is_cross, place_in_unet, num_heads, **kwargs
+    ):
+        b = q.shape[0] // num_heads
+
+        sim = torch.einsum("h i d, h j d -> h i j", q, k) * kwargs.get("scale")
+        attn = sim.softmax(-1)
+        out = torch.einsum("h i j, h j d -> h i d", attn, v)
+        return out
+
+    def self_attn_forward(self, q, k, v, num_heads, bs):
+        num_heads *= bs
         if q.shape[0] // num_heads == 3:
+            # actually won't be used
+            qs = list(q.chunk(q.shape[0] // self.bs))
+            ks = list(k.chunk(k.shape[0] // self.bs))
+            vs = list(v.chunk(v.shape[0] // self.bs))
             if self.self_replace_steps <= (
                 (self.cur_step + self.start_steps + 1) * 1.0 / self.num_steps
             ):
-                q = torch.cat([q[: num_heads * 2], q[num_heads : num_heads * 2]])
-                k = torch.cat([k[: num_heads * 2], k[:num_heads]])
-                v = torch.cat([v[: num_heads * 2], v[:num_heads]])
+                for i in range(len(qs)):
+                    qs[i] = torch.cat(
+                        [qs[i][: num_heads * 2], qs[i][num_heads : num_heads * 2]]
+                    )
+                    ks[i] = torch.cat([ks[i][: num_heads * 2], ks[i][:num_heads]])
+                    vs[i] = torch.cat([vs[i][: num_heads * 2], vs[i][:num_heads]])
             else:
-                q = torch.cat([q[:num_heads], q[:num_heads], q[:num_heads]])
-                k = torch.cat([k[:num_heads], k[:num_heads], k[:num_heads]])
-                v = torch.cat([v[: num_heads * 2], v[:num_heads]])
+                for i in range(len(qs)):
+                    qs[i] = torch.cat(
+                        [qs[i][:num_heads], qs[i][:num_heads], qs[i][:num_heads]]
+                    )
+                    ks[i] = torch.cat(
+                        [ks[i][:num_heads], ks[i][:num_heads], ks[i][:num_heads]]
+                    )
+                    vs[i] = torch.cat([vs[i][: num_heads * 2], vs[i][:num_heads]])
+            q, k, v = torch.cat(qs), torch.cat(ks), torch.cat(vs)
             return q, k, v
         else:
             qu, qc = q.chunk(2)
@@ -280,23 +319,106 @@ class UnifiedAttentionControl:
                 torch.cat([vu, vc], dim=0),
             )
 
-    def store_attention(self, attn, is_cross, place_in_unet):
-        key = f"{place_in_unet}_{'cross' if is_cross else 'self'}"
-        if key not in self.attention_store:
-            self.attention_store[key] = []
-        self.attention_store[key].append(attn)
+    def forward(self, attn, is_cross: bool, place_in_unet: str):
+        if is_cross:
+            h = attn.shape[0] // self.batch_size
+            attn = attn.reshape(self.batch_size, h, *attn.shape[1:])
+            attn_base, attn_repalce, attn_masa = attn[0], attn[1], attn[2]
+            attn_replace_new = self.replace_cross_attention(attn_masa, attn_repalce)
+            attn_base_store = self.replace_cross_attention(attn_base, attn_repalce)
+            if self.cross_replace_steps >= (
+                (self.cur_step + self.start_steps + 1) * 1.0 / self.num_steps
+            ):
+                attn[1] = attn_base_store
+            attn_store = torch.cat([attn_base_store, attn_replace_new])
+            attn = attn.reshape(self.batch_size * h, *attn.shape[2:])
+            attn_store = attn_store.reshape(2 * h, *attn_store.shape[2:])
+            super(AttentionControlEdit, self).forward(
+                attn_store, is_cross, place_in_unet
+            )
+        return attn
 
-    def get_average_attention(self):
-        average_attention = {
-            key: [item / self.cur_step for item in self.attention_store[key]]
-            for key in self.attention_store
-        }
-        return average_attention
+    def __init__(
+        self,
+        prompts,
+        num_steps: int,
+        start_steps: int,
+        cross_replace_steps: Union[
+            float, Tuple[float, float], Dict[str, Tuple[float, float]]
+        ],
+        self_replace_steps: Union[float, Tuple[float, float]],
+        local_blend: Optional[LocalBlend],
+    ):
+        super(AttentionControlEdit, self).__init__()
+        self.batch_size = len(prompts) + 1
+        self.self_replace_steps = self_replace_steps
+        self.cross_replace_steps = cross_replace_steps
+        self.num_steps = num_steps
+        self.start_steps = start_steps
+        self.local_blend = local_blend
 
-    def reset(self):
-        self.cur_step = 0
-        self.cur_att_layer = 0
-        self.attention_store = {}
+
+class AttentionReplace(AttentionControlEdit):
+    def replace_cross_attention(self, attn_base, att_replace):
+        return torch.einsum("hpw,bwn->bhpn", attn_base, self.mapper)
+
+    def __init__(
+        self,
+        prompts,
+        num_steps: int,
+        cross_replace_steps: float,
+        self_replace_steps: float,
+        local_blend: Optional[LocalBlend] = None,
+    ):
+        super(AttentionReplace, self).__init__(
+            prompts, num_steps, cross_replace_steps, self_replace_steps, local_blend
+        )
+        self.mapper = (
+            seq_aligner.get_replacement_mapper(prompts, tokenizer)
+            .to(device)
+            .to(torch_dtype)
+        )
+
+
+class AttentionRefine(AttentionControlEdit):
+    def replace_cross_attention(self, attn_masa, att_replace):
+        attn_masa_replace = attn_masa[:, :, self.mapper].squeeze()
+        attn_replace = attn_masa_replace * self.alphas + att_replace * (1 - self.alphas)
+        return attn_replace
+
+    def __init__(
+        self,
+        prompts,
+        prompt_specifiers,
+        num_steps: int,
+        start_steps: int,
+        cross_replace_steps: float,
+        self_replace_steps: float,
+        local_blend: Optional[LocalBlend] = None,
+    ):
+        super(AttentionRefine, self).__init__(
+            prompts,
+            num_steps,
+            start_steps,
+            cross_replace_steps,
+            self_replace_steps,
+            local_blend,
+        )
+        self.mapper, alphas, ms, alpha_e, alpha_m = seq_aligner.get_refinement_mapper(
+            prompts, prompt_specifiers, tokenizer, encoder, device
+        )
+        self.mapper, alphas, ms = (
+            self.mapper.to(device),
+            alphas.to(device).to(torch_dtype),
+            ms.to(device).to(torch_dtype),
+        )
+        self.alphas = alphas.reshape(alphas.shape[0], 1, 1, alphas.shape[1])
+        self.ms = ms.reshape(ms.shape[0], 1, 1, ms.shape[1])
+        ms = ms.to(device)
+        alpha_e = alpha_e.to(device)
+        alpha_m = alpha_m.to(device)
+        t_len = len(tokenizer(prompts[1])["input_ids"])
+        self.local_blend.set_map(ms, alphas, alpha_e, alpha_m, t_len)
 
 
 def get_equalizer(
@@ -346,7 +468,7 @@ def inference(
     num_start = num_inference_steps - num_denoise_num
     # create the CAC controller.
     local_blend = LocalBlend(thresh_e=thresh_e, thresh_m=thresh_m, save_inter=False)
-    controller = UnifiedAttentionControl(
+    controller = AttentionRefine(
         prompts=[source_prompt, target_prompt],
         prompt_specifiers=[[local, mutual]],
         num_steps=num_inference_steps,
@@ -355,7 +477,7 @@ def inference(
         self_replace_steps=self_replace_steps,
         local_blend=local_blend,
     )
-    ptp_utils.register_attention_control(pipe, controller)
+    pipe.controller = controller
 
     results = pipe(
         prompt=target_prompt,
@@ -388,7 +510,7 @@ output = inference(
     Image.open("abandoned_greenhouse.jpg"),
     "360-degree panoramic image, arafed view of a large glass structure with a pair of shoes in it, derelict, ligne claire, walkthrough, boxing ring, many plants and infinite pool, le corbeusier, left align, retracing, green house, the empress’ swirling gardens, asylum, domes",
     "360-degree panoramic image, arafed view of a large glass structure with a pair of shoes in it, derelict, ligne claire, walkthrough, boxing ring, many plants and infinite pool, le corbeusier, left align, retracing, green house, the empress’ swirling gardens, asylum, domes add a tiger",
-    "",
+    "tiger",
     "",
     "",
     "",

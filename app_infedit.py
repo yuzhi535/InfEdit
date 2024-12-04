@@ -1,12 +1,11 @@
 from diffusers import LCMScheduler
-from einops import rearrange
 from pipeline_ead import EditPipeline
 import os
 import gradio as gr
 import torch
 from PIL import Image
 import torch.nn.functional as nnf
-from typing import Optional, Union, Tuple, List, Callable, Dict
+from typing import Optional, Union, Tuple, List, Dict
 import abc
 import ptp_utils
 import utils
@@ -266,18 +265,32 @@ class AttentionControlEdit(AttentionStore, abc.ABC):
         out = torch.einsum("h i j, h j d -> h i d", attn, v)
         return out
 
-    def self_attn_forward(self, q, k, v, num_heads):
+    def self_attn_forward(self, q, k, v, num_heads, bs):
+        num_heads *= bs
         if q.shape[0] // num_heads == 3:
+            # actually won't be used
+            qs = list(q.chunk(q.shape[0] // self.bs))
+            ks = list(k.chunk(k.shape[0] // self.bs))
+            vs = list(v.chunk(v.shape[0] // self.bs))
             if self.self_replace_steps <= (
                 (self.cur_step + self.start_steps + 1) * 1.0 / self.num_steps
             ):
-                q = torch.cat([q[: num_heads * 2], q[num_heads : num_heads * 2]])
-                k = torch.cat([k[: num_heads * 2], k[:num_heads]])
-                v = torch.cat([v[: num_heads * 2], v[:num_heads]])
+                for i in range(len(qs)):
+                    qs[i] = torch.cat(
+                        [qs[i][: num_heads * 2], qs[i][num_heads : num_heads * 2]]
+                    )
+                    ks[i] = torch.cat([ks[i][: num_heads * 2], ks[i][:num_heads]])
+                    vs[i] = torch.cat([vs[i][: num_heads * 2], vs[i][:num_heads]])
             else:
-                q = torch.cat([q[:num_heads], q[:num_heads], q[:num_heads]])
-                k = torch.cat([k[:num_heads], k[:num_heads], k[:num_heads]])
-                v = torch.cat([v[: num_heads * 2], v[:num_heads]])
+                for i in range(len(qs)):
+                    qs[i] = torch.cat(
+                        [qs[i][:num_heads], qs[i][:num_heads], qs[i][:num_heads]]
+                    )
+                    ks[i] = torch.cat(
+                        [ks[i][:num_heads], ks[i][:num_heads], ks[i][:num_heads]]
+                    )
+                    vs[i] = torch.cat([vs[i][: num_heads * 2], vs[i][:num_heads]])
+            q, k, v = torch.cat(qs), torch.cat(ks), torch.cat(vs)
             return q, k, v
         else:
             qu, qc = q.chunk(2)
@@ -446,7 +459,6 @@ def inference(
     user_instruct="",
     api_key="",
 ):
-    print(img)
     if user_instruct != "" and api_key != "":
         (
             source_prompt,
@@ -460,11 +472,11 @@ def inference(
         self_replace_steps = replace_steps
 
     torch.manual_seed(seed)
-    
+
     # do not resize it!!!
     # ratio = min(height / img.height, width / img.width)
     # img = img.resize((int(img.width * ratio), int(img.height * ratio)))
-    width, height = img.size   # haha, any size
+    width, height = img.size  # haha, any size
     if denoise is False:
         strength = 1
     num_denoise_num = math.trunc(num_inference_steps * strength)
@@ -480,7 +492,7 @@ def inference(
         self_replace_steps=self_replace_steps,
         local_blend=local_blend,
     )
-    ptp_utils.register_attention_control(pipe, controller)
+    pipe.controller = controller
 
     results = pipe(
         prompt=target_prompt,
@@ -493,19 +505,19 @@ def inference(
         strength=strength,
         guidance_scale=guidance_t,
         source_guidance_scale=guidance_s,
-        denoise_model=denoise,
+        denoise=denoise,
         callback=controller.step_callback,
         height=height,
         width=width,
     )
 
-    return results.images[0]
+    return replace_nsfw_images(results)
 
 
 def replace_nsfw_images(results):
-    for i in range(len(results.images)):
-        if results.nsfw_content_detected[i]:
-            results.images[i] = Image.open("nsfw.png")
+    # for i in range(len(results.images)):
+    #     if results.nsfw_content_detected[i]:
+    #         results.images[i] = Image.open("nsfw.png")
     return results.images[0]
 
 

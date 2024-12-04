@@ -123,23 +123,22 @@ def register_attention_control(model, controller):
 
             return hidden_states
 
-    def register_recr(net_, count, place_in_unet):
-        for idx, m in enumerate(net_.modules()):
-            # print(m.__class__.__name__)
-            if m.__class__.__name__ == "Attention":
+    def register_attention_processors(net_, count, place_in_unet):
+        for module in net_.modules():  # modules() 自动处理嵌套遍历
+            if module.__class__.__name__ == "Attention":
                 count += 1
-                m.processor = AttnProcessor(place_in_unet)
+                module.processor = AttnProcessor(place_in_unet)
         return count
 
     cross_att_count = 0
     sub_nets = model.unet.named_children()
     for net in sub_nets:
         if "down" in net[0]:
-            cross_att_count += register_recr(net[1], 0, "down")
+            cross_att_count += register_attention_processors(net[1], 0, "down")
         elif "up" in net[0]:
-            cross_att_count += register_recr(net[1], 0, "up")
+            cross_att_count += register_attention_processors(net[1], 0, "up")
         elif "mid" in net[0]:
-            cross_att_count += register_recr(net[1], 0, "mid")
+            cross_att_count += register_attention_processors(net[1], 0, "mid")
     controller.num_att_layers = cross_att_count
 
 
