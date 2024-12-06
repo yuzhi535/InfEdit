@@ -1,10 +1,9 @@
+import copy
 import inspect
 import math
 from typing import Any, Callable, Dict, List, Optional, Union, Tuple
-import os
 import PIL.Image
 from einops import rearrange
-from tqdm import tqdm
 import numpy as np
 import PIL
 import torch
@@ -25,7 +24,6 @@ from diffusers.pipelines.stable_diffusion import StableDiffusionPipelineOutput
 from diffusers.pipelines.stable_diffusion.safety_checker import (
     StableDiffusionSafetyChecker,
 )
-import ptp_utils
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -222,6 +220,7 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
         self.register_to_config(requires_safety_checker=requires_safety_checker)
         self.controller = controller
+        self.processor_manager = ProcessorManager()
 
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline._encode_prompt
     def _encode_prompt(
@@ -733,7 +732,7 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
 
         # unet custom attention processor
         processor = AttnProcessor(
-            batch_size=6,
+            batch_size=6 if do_classifier_free_guidance else 3,
             latent_h=height // 8,
             views=views,
             latent_w=width // 8,
@@ -749,7 +748,7 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if i >= mad_thereshold:
-                    pass
+                    processor.apply_mad = False
                 else:
                     pass
                 batched_latent_views = []
@@ -1029,6 +1028,7 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
             if hasattr(module, "set_processor"):
                 if not isinstance(processor, dict):
                     assert module.__class__.__name__ == "Attention", "not attention! "
+
                     module.processor = AttnProcessor(
                         processor.latent_h,
                         processor.latent_w,
@@ -1044,15 +1044,16 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
                         processor.num_steps,
                         processor.controller,
                     )
-                    module.processor.apply_mad = True
-                    module.processor.place_in_unet = place_in_unet
+                    module.processor = self.processor_manager.get_processor(
+                        processor, place_in_unet=place_in_unet, apply_mad=True
+                    )
                     return 1
 
                 else:
                     raise NotImplementedError
-            count=0
+            count = 0
             for _, child in module.named_children():
-                count+=fn_recursive_attn_processor(
+                count += fn_recursive_attn_processor(
                     place_in_unet, child, processor, count
                 )
             return count
@@ -1071,7 +1072,7 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
             count += fn_recursive_attn_processor("up", module, processor, count)
 
         self.controller.num_att_layers = count
-        print(f'count={count}')
+        print(f"num_att_layers={count}")
 
 
 class AttnProcessor:
@@ -1117,6 +1118,8 @@ class AttnProcessor:
         self.start_steps = start_steps
         self.cur_step = 0
         self.num_steps = num_steps
+        self.place_in_unet = None
+        self.apply_mad = None
 
     def compute_current_sizes(self, batch):
         bs, sequence_length, inner_dim = batch.shape
@@ -1137,11 +1140,18 @@ class AttnProcessor:
             batch_v (torch.Tensor): The batched value tensor.
 
         Returns:
-            tuple: A tuple containing the merged query, key, and value tensors, and the down factor.
+            tuple: A tuple containing:
+                - torch.Tensor: The merged query tensor.
+                - torch.Tensor: The merged key tensor.
+                - torch.Tensor: The merged value tensor.
+                - int: The down factor used for merging.
         """
         views_len, spatial_size, down_factor, latent_h, latent_w, inner_dim = (
             self.compute_current_sizes(batch_q)
         )
+        if down_factor <= 0:
+            raise ValueError("down_factor must be greater than zero")
+
         batch_q_views = rearrange(
             batch_q, "(b v) (h w) d -> b v d h w", v=views_len, h=spatial_size
         )
@@ -1365,3 +1375,55 @@ class AttnProcessor:
         self.cur_att_layer = 0
         self.cur_step += 1
         return hidden_states
+
+
+class ProcessorManager:
+    def __init__(self):
+        self._processor_cache = {}  # 用于缓存基础processor
+
+    def get_processor(self, base_processor, place_in_unet, apply_mad):
+        """获取或创建processor实例"""
+        # 使用关键参数作为缓存key
+        cache_key = tuple(
+            tuple(x) if isinstance(x, list) else x
+            for x in (
+                base_processor.latent_h,
+                base_processor.latent_w,
+                base_processor.views,
+                base_processor.bs,
+                base_processor.stride,
+                base_processor.latent_size,
+                base_processor.mad,
+                base_processor.is_cons,
+                base_processor.self_replace_steps,
+                base_processor.num_start,
+                base_processor.start_steps,
+                base_processor.num_steps,
+                hash(str(base_processor.controller)),  # 如果controller是复杂对象
+            )
+        )
+        if cache_key not in self._processor_cache:
+            # 创建新的基础processor
+            self._processor_cache[cache_key] = AttnProcessor(
+                base_processor.latent_h,
+                base_processor.latent_w,
+                base_processor.views,
+                base_processor.bs,
+                base_processor.stride,
+                base_processor.latent_size,
+                base_processor.mad,
+                base_processor.is_cons,
+                base_processor.self_replace_steps,
+                base_processor.num_start,
+                base_processor.start_steps,
+                base_processor.num_steps,
+                base_processor.controller,
+            )
+
+        # 创建轻量级processor,只设置place_in_unet
+        new_processor = AttnProcessor.__new__(AttnProcessor)
+        for key, value in vars(self._processor_cache[cache_key]).items():
+            setattr(new_processor, key, value)
+        new_processor.place_in_unet = place_in_unet
+        new_processor.apply_mad = apply_mad
+        return new_processor

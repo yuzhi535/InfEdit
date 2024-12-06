@@ -70,7 +70,7 @@ class LocalBlend:
         image = image.cpu().numpy().astype(np.uint8)
         image = np.array(Image.fromarray(image).resize((256, 256)))
         if not os.path.exists(f"inter/{caption}"):
-            os.mkdir(f"inter/{caption}")
+            os.makedirs(f"inter/{caption}", exist_ok=True)
         ptp_utils.save_images(image, f"inter/{caption}/{i}.jpg")
 
     def __call__(
@@ -204,7 +204,7 @@ class AttentionStore(AttentionControl):
     def forward(self, attn, is_cross: bool, place_in_unet: str):
         key = f"{place_in_unet}_{'cross' if is_cross else 'self'}"
         # for k, v in self.step_store.items():
-            # print(f"k: len(v) = {k}: {len(v)}")
+        # print(f"k: len(v) = {k}: {len(v)}")
         if attn.shape[1] <= 32**2:  # avoid memory overhead
             self.step_store[key].append(attn)
         return attn
@@ -382,8 +382,12 @@ class AttentionReplace(AttentionControlEdit):
 
 class AttentionRefine(AttentionControlEdit):
     def replace_cross_attention(self, attn_masa, att_replace):
+        # 注：此步骤无实际作用，可以移除
         attn_masa_replace = attn_masa[:, :, self.mapper].squeeze()
+
+        # 使用 self.alphas 作为权重进行线性插值
         attn_replace = attn_masa_replace * self.alphas + att_replace * (1 - self.alphas)
+
         return attn_replace
 
     def __init__(
@@ -441,7 +445,7 @@ def inference(
     source_prompt,
     target_prompt,
     local,
-    mutual,
+    target,
     positive_prompt,
     negative_prompt,
     guidance_s,
@@ -462,15 +466,17 @@ def inference(
     torch.manual_seed(seed)
     # ratio = min(height / img.height, width / img.width)
     # img = img.resize((int(img.width * ratio), int(img.height * ratio)))
+    print(f'Image size: {img.size}')
+    width, height = img.size
     if denoise is False:
         strength = 1
     num_denoise_num = math.trunc(num_inference_steps * strength)
     num_start = num_inference_steps - num_denoise_num
     # create the CAC controller.
-    local_blend = LocalBlend(thresh_e=thresh_e, thresh_m=thresh_m, save_inter=False)
+    local_blend = LocalBlend(thresh_e=thresh_e, thresh_m=thresh_m, save_inter=True)
     controller = AttentionRefine(
         prompts=[source_prompt, target_prompt],
-        prompt_specifiers=[[local, mutual]],
+        prompt_specifiers=[[local, target]],
         num_steps=num_inference_steps,
         start_steps=num_start,
         cross_replace_steps=cross_replace_steps,
@@ -507,25 +513,25 @@ def replace_nsfw_images(results):
 
 
 output = inference(
-    Image.open("abandoned_greenhouse.jpg"),
-    "360-degree panoramic image, arafed view of a large glass structure with a pair of shoes in it, derelict, ligne claire, walkthrough, boxing ring, many plants and infinite pool, le corbeusier, left align, retracing, green house, the empress’ swirling gardens, asylum, domes",
-    "360-degree panoramic image, arafed view of a large glass structure with a pair of shoes in it, derelict, ligne claire, walkthrough, boxing ring, many plants and infinite pool, le corbeusier, left align, retracing, green house, the empress’ swirling gardens, asylum, domes add a tiger",
-    "tiger",
-    "",
-    "",
-    "",
-    1,
-    2,
-    15,
-    1024,
-    512,
-    0,
-    1,
-    0.7,
-    0.7,
-    0.6,
-    0.6,
-    False,
+    img=Image.open("images/james.jpg"),
+    source_prompt="basketball",
+    target_prompt="soccer",
+    local="basketball",
+    target="",
+    positive_prompt="",
+    negative_prompt="",
+    guidance_s=1,
+    guidance_t=2,
+    num_inference_steps=15,
+    width=1024,
+    height=512,
+    seed=0,
+    strength=1,
+    cross_replace_steps=0.7,
+    self_replace_steps=0.7,
+    thresh_e=0.6,
+    thresh_m=0.6,
+    denoise=False,
 )
 
 output.save("output.png")

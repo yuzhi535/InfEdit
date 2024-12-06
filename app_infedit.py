@@ -323,9 +323,9 @@ class AttentionControlEdit(AttentionStore, abc.ABC):
         if is_cross:
             h = attn.shape[0] // self.batch_size
             attn = attn.reshape(self.batch_size, h, *attn.shape[1:])
-            attn_base, attn_repalce, attn_masa = attn[0], attn[1], attn[2]
-            attn_replace_new = self.replace_cross_attention(attn_masa, attn_repalce)
-            attn_base_store = self.replace_cross_attention(attn_base, attn_repalce)
+            attn_base, attn_replace, attn_masa = attn[0], attn[1], attn[2]
+            attn_replace_new = self.replace_cross_attention(attn_masa, attn_replace)
+            attn_base_store = self.replace_cross_attention(attn_base, attn_replace)
             if self.cross_replace_steps >= (
                 (self.cur_step + self.start_steps + 1) * 1.0 / self.num_steps
             ):
@@ -476,13 +476,15 @@ def inference(
     # do not resize it!!!
     # ratio = min(height / img.height, width / img.width)
     # img = img.resize((int(img.width * ratio), int(img.height * ratio)))
-    width, height = img.size  # haha, any size
+    # img = img.resize((width, height))
+    # print(img.size, height, width)
+    width, height = img.size
     if denoise is False:
         strength = 1
     num_denoise_num = math.trunc(num_inference_steps * strength)
     num_start = num_inference_steps - num_denoise_num
     # create the CAC controller.
-    local_blend = LocalBlend(thresh_e=thresh_e, thresh_m=thresh_m, save_inter=False)
+    local_blend = LocalBlend(thresh_e=thresh_e, thresh_m=thresh_m, save_inter=True)
     controller = AttentionRefine(
         [source_prompt, target_prompt],
         [[local, mutual]],
@@ -510,6 +512,21 @@ def inference(
         height=height,
         width=width,
     )
+    # show_cross_attention(controller, res=16, from_where=("up", "down"), prompts=[target_prompt])
+    # show_self_attention_comp(
+    #     controller, res=16, from_where=("up", "down"), prompts=[target_prompt]
+    # )
+
+    # Clear GPU memory
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # Reset attention store
+    controller.reset()
+
+    # Delete controller to free memory
+    del controller
+    torch.cuda.empty_cache()  # Second empty_cache to ensure cleanup
 
     return replace_nsfw_images(results)
 
@@ -519,6 +536,87 @@ def replace_nsfw_images(results):
     #     if results.nsfw_content_detected[i]:
     #         results.images[i] = Image.open("nsfw.png")
     return results.images[0]
+
+
+def aggregate_attention(
+    attention_store: AttentionStore,
+    res: int,
+    from_where: List[str],
+    is_cross: bool,
+    select: int,
+    prompts: List[str] = None,
+):
+    out = []
+    attention_maps = attention_store.get_average_attention()
+    num_pixels = res**2
+    for location in from_where:
+        for item in attention_maps[f"{location}_{'cross' if is_cross else 'self'}"]:
+            if item.shape[1] == num_pixels:
+                cross_maps = item.reshape(len(prompts), -1, res, res, item.shape[-1])[
+                    select
+                ]
+                out.append(cross_maps)
+    # 添加检查确保out非空
+    if not out:
+        raise ValueError("No valid attention maps found")
+
+    out = torch.cat(out, dim=0)
+    # 添加shape检查
+    if out.shape[0] == 0:
+        raise ValueError("Empty tensor after concatenation")
+
+    out = out.sum(0) / out.shape[0]
+    return out.cpu()
+
+
+def show_cross_attention(
+    attention_store: AttentionStore,
+    res: int,
+    from_where: List[str],
+    select: int = 0,
+    prompts: List[str] = None,
+):
+    print(prompts)
+    tokens = tokenizer.encode(prompts[select])
+    decoder = tokenizer.decode
+    attention_maps = aggregate_attention(attention_store, res, from_where, True, select)
+    images = []
+    for i in range(len(tokens)):
+        image = attention_maps[:, :, i]
+        image = 255 * image / image.max()
+        image = image.unsqueeze(-1).expand(*image.shape, 3)
+        image = image.numpy().astype(np.uint8)
+        image = np.array(Image.fromarray(image).resize((256, 256)))
+        image = ptp_utils.text_under_image(image, decoder(int(tokens[i])))
+        images.append(image)
+    ptp_utils.view_images(np.stack(images, axis=0))
+
+
+def show_self_attention_comp(
+    attention_store: AttentionStore,
+    res: int,
+    from_where: List[str],
+    max_com=10,
+    select: int = 0,
+):
+    attention_maps = (
+        aggregate_attention(attention_store, res, from_where, False, select)
+        .numpy()
+        .reshape((res**2, res**2))
+    )
+    u, s, vh = np.linalg.svd(
+        attention_maps - np.mean(attention_maps, axis=1, keepdims=True)
+    )
+    images = []
+    for i in range(max_com):
+        image = vh[i].reshape(res, res)
+        image = image - image.min()
+        image = 255 * image / image.max()
+        image = np.repeat(np.expand_dims(image, axis=2), 3, axis=2).astype(np.uint8)
+        image = Image.fromarray(image).resize((256, 256))
+        image = np.array(image)
+        images.append(image)
+    ptp_utils.view_images(np.concatenate(images, axis=1))
 
 
 css = """.cycle-diffusion-div div{display:inline-flex;align-items:center;gap:.8rem;font-size:1.75rem}.cycle-diffusion-div div h1{font-weight:900;margin-bottom:7px}.cycle-diffusion-div p{margin-bottom:10px;font-size:94%}.cycle-diffusion-div p a{text-decoration:underline}.tabs{margin-top:0;margin-bottom:0}#gallery{min-height:20rem}
@@ -682,9 +780,9 @@ with gr.Blocks(css=css) as demo:
                             label="Target blend thresh", value=0.6, minimum=0, maximum=1
                         )
                     with gr.Row():
-                        mutual = gr.Textbox(label="Source blend", placeholder="")
+                        mutual = gr.Textbox(label="mutual blend", placeholder="")
                         thresh_m = gr.Slider(
-                            label="Source blend thresh", value=0.6, minimum=0, maximum=1
+                            label="mutual blend thresh", value=0.6, minimum=0, maximum=1
                         )
                     with gr.Row():
                         cross_replace_steps = gr.Slider(
