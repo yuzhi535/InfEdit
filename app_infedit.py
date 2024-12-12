@@ -58,7 +58,7 @@ class LocalBlend:
         image = image.cpu().numpy().astype(np.uint8)
         image = np.array(Image.fromarray(image).resize((256, 256)))
         if not os.path.exists(f"inter/{caption}"):
-           os.mkdir(f"inter/{caption}") 
+           os.makedirs(f"inter/{caption}", exist_ok=True) 
         ptp_utils.save_images(image, f"inter/{caption}/{i}.jpg")
         
 
@@ -346,7 +346,7 @@ def inference(img, source_prompt, target_prompt,
     num_denoise_num = math.trunc(num_inference_steps*strength)
     num_start = num_inference_steps-num_denoise_num
     # create the CAC controller.
-    local_blend = LocalBlend(thresh_e=thresh_e, thresh_m=thresh_m, save_inter=False)
+    local_blend = LocalBlend(thresh_e=thresh_e, thresh_m=thresh_m, save_inter=True)
     controller = AttentionRefine([source_prompt, target_prompt],[[local, mutual]],
                     num_inference_steps,
                     num_start,
@@ -374,9 +374,9 @@ def inference(img, source_prompt, target_prompt,
 
 
 def replace_nsfw_images(results):
-    for i in range(len(results.images)):
-        if results.nsfw_content_detected[i]:
-            results.images[i] = Image.open("nsfw.png")
+    # for i in range(len(results.images)):
+    #     if results.nsfw_content_detected[i]:
+    #         results.images[i] = Image.open("nsfw.png")
     return results.images[0]
 
 

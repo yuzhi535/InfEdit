@@ -1,7 +1,7 @@
 accelerate
 torch
 torchvision
-git+https://github.com/huggingface/diffusers.git
+git+https://gh-proxy.com/https://github.com/huggingface/diffusers.git
 Pillow
 transformers
 opencv-python

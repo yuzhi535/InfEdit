@@ -18,7 +18,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.pipelines.stable_diffusion import StableDiffusionPipelineOutput
 from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
-
+import os
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -481,7 +481,7 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
 
         # get latents
         clean_latents = init_latents
-        if denoise_model:
+        if denoise_model:  # False
             init_latents = self.scheduler.add_noise(init_latents, noise, timestep)
             latents = init_latents
         else:
@@ -523,7 +523,7 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
         # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
         # corresponds to doing no classifier free guidance.
         do_classifier_free_guidance = guidance_scale > 1.0
-
+        
         # 3. Encode input prompt
         text_encoder_lora_scale = (
             cross_attention_kwargs.get("scale", None) if cross_attention_kwargs is not None else None
@@ -647,6 +647,9 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
                         mutual_noise_pred_text
                     ) = concat_noise_pred.chunk(6, dim=0)
 
+
+                    # two branch
+
                     noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
                     source_noise_pred = source_noise_pred_uncond + source_guidance_scale * (
                         source_noise_pred_text - source_noise_pred_uncond
@@ -661,7 +664,8 @@ class EditPipeline(DiffusionPipeline, TextualInversionLoaderMixin, LoraLoaderMix
                 noise = torch.randn(
                     latents.shape, dtype=latents.dtype, device=latents.device, generator=generator
                 )
-
+                
+                # clean_latents as x_0
                 _, latents, pred_x0 = ddcm_sampler(
                   self.scheduler, source_latents, 
                   latents, t, 
