@@ -1,4 +1,6 @@
 from diffusers import LCMScheduler
+from exceptiongroup import catch
+import yaml
 from pipeline_ead import EditPipeline
 import os
 import gradio as gr
@@ -12,13 +14,18 @@ import utils
 import numpy as np
 import seq_aligner
 import math
+from torch.profiler import profile, record_function, ProfilerActivity
 
 LOW_RESOURCE = False
 MAX_NUM_WORDS = 77
 
 is_colab = utils.is_google_colab()
-colab_instruction = "" if is_colab else """
+colab_instruction = (
+    ""
+    if is_colab
+    else """
 Colab Instuction"""
+)
 
 torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 model_id_or_path = "SimianLuo/LCM_Dreamshaper_v7"
@@ -27,10 +34,21 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 
 if is_colab:
     scheduler = LCMScheduler.from_config(model_id_or_path, subfolder="scheduler")
-    pipe = EditPipeline.from_pretrained(model_id_or_path, scheduler=scheduler, torch_dtype=torch_dtype)
+    pipe = EditPipeline.from_pretrained(
+        model_id_or_path, scheduler=scheduler, torch_dtype=torch_dtype
+    )
 else:
-    scheduler = LCMScheduler.from_config(model_id_or_path, use_auth_token=os.environ.get("USER_TOKEN"), subfolder="scheduler")
-    pipe = EditPipeline.from_pretrained(model_id_or_path, use_auth_token=os.environ.get("USER_TOKEN"), scheduler=scheduler, torch_dtype=torch_dtype)
+    scheduler = LCMScheduler.from_config(
+        model_id_or_path,
+        use_auth_token=os.environ.get("USER_TOKEN"),
+        subfolder="scheduler",
+    )
+    pipe = EditPipeline.from_pretrained(
+        model_id_or_path,
+        use_auth_token=os.environ.get("USER_TOKEN"),
+        scheduler=scheduler,
+        torch_dtype=torch_dtype,
+    )
 
 tokenizer = pipe.tokenizer
 encoder = pipe.text_encoder
@@ -40,64 +58,104 @@ if torch.cuda.is_available():
 
 
 class LocalBlend:
-    
-    def get_mask(self,x_t,maps,word_idx, thresh, i):
-        maps = maps * word_idx.reshape(1,1,1,1,-1)
-        maps = (maps[:,:,:,:,1:self.len-1]).mean(0,keepdim=True)
+
+    def get_mask(self, x_t, maps, word_idx, thresh, i):
+        """
+        Generates a mask based on the input tensor, maps, word indices, threshold, and iteration index.
+
+        Args:
+            x_t (torch.Tensor): The input tensor with shape (batch_size, channels, height, width).
+            maps (torch.Tensor): The tensor containing maps with shape (batch_size, channels, height, width, num_words).
+            word_idx (torch.Tensor): The tensor containing word indices with shape (num_words,).
+            thresh (float): The threshold value to generate the mask.
+            i (int): The iteration index.
+
+        Returns:
+            torch.Tensor: A boolean mask tensor with the same spatial dimensions as the input tensor.
+        """
+        maps = maps * word_idx.reshape(1, 1, 1, 1, -1)
+        maps = (maps[:, :, :, :, 1 : self.len - 1]).mean(0, keepdim=True)
         maps = (maps).max(-1)[0]
         maps = nnf.interpolate(maps, size=(x_t.shape[2:]))
         maps = maps / maps.max(2, keepdim=True)[0].max(3, keepdim=True)[0]
         mask = maps > thresh
         return mask
 
-
-    def save_image(self,mask,i, caption):
+    def save_image(self, mask, i, caption):
         image = mask[0, 0, :, :]
         image = 255 * image / image.max()
         image = image.unsqueeze(-1).expand(*image.shape, 3)
         image = image.cpu().numpy().astype(np.uint8)
-        image = np.array(Image.fromarray(image).resize((256, 256)))
+        image = np.array(Image.fromarray(image).resize((self.width, self.height)))
         if not os.path.exists(f"inter/{caption}"):
-           os.makedirs(f"inter/{caption}", exist_ok=True) 
+            os.makedirs(f"inter/{caption}", exist_ok=True)
         ptp_utils.save_images(image, f"inter/{caption}/{i}.jpg")
-        
 
-    def __call__(self, i, x_s, x_t, x_m, attention_store, alpha_prod, temperature=0.15, use_xm=False):
+    def __call__(
+        self,
+        i,
+        x_s,
+        x_t,
+        x_m,
+        attention_store,
+        alpha_prod,
+        temperature=0.15,
+        use_xm=False,
+    ):
         maps = attention_store["down_cross"][2:4] + attention_store["up_cross"][:3]
-        h,w = x_t.shape[2],x_t.shape[3]
-        h , w = ((h+1)//2+1)//2, ((w+1)//2+1)//2
-        maps = [item.reshape(2, -1, 1, h // int((h*w/item.shape[-2])**0.5),  w // int((h*w/item.shape[-2])**0.5), MAX_NUM_WORDS) for item in maps]
+        h, w = x_t.shape[2], x_t.shape[3]
+        h, w = ((h + 1) // 2 + 1) // 2, ((w + 1) // 2 + 1) // 2
+        maps = [
+            item.reshape(
+                2,
+                -1,
+                1,
+                h // int((h * w / item.shape[-2]) ** 0.5),
+                w // int((h * w / item.shape[-2]) ** 0.5),
+                MAX_NUM_WORDS,
+            )
+            for item in maps
+        ]
         maps = torch.cat(maps, dim=1)
-        maps_s = maps[0,:]
-        maps_m = maps[1,:]
+        maps_s = maps[0, :]
+        maps_m = maps[1, :]
         thresh_e = temperature / alpha_prod ** (0.5)
         if thresh_e < self.thresh_e:
-          thresh_e = self.thresh_e
+            thresh_e = self.thresh_e
         thresh_m = self.thresh_m
         mask_e = self.get_mask(x_t, maps_m, self.alpha_e, thresh_e, i)
-        mask_m = self.get_mask(x_t, maps_s, (self.alpha_m-self.alpha_me), thresh_m, i)
+        mask_m = self.get_mask(x_t, maps_s, (self.alpha_m - self.alpha_me), thresh_m, i)
         mask_me = self.get_mask(x_t, maps_m, self.alpha_me, self.thresh_e, i)
         if self.save_inter:
-            self.save_image(mask_e,i,"mask_e")
-            self.save_image(mask_m,i,"mask_m")
-            self.save_image(mask_me,i,"mask_me")
+            self.save_image(mask_e, i, "mask_e")
+            self.save_image(mask_m, i, "mask_m")
+            self.save_image(mask_me, i, "mask_me") 
 
         if self.alpha_e.sum() == 0:
-          x_t_out = x_t
+            x_t_out = x_t
         else:
-          x_t_out = torch.where(mask_e, x_t, x_m)
+            x_t_out = torch.where(mask_e, x_t, x_m)
         x_t_out = torch.where(mask_m, x_s, x_t_out)
         if use_xm:
-          x_t_out = torch.where(mask_me, x_m, x_t_out)
-        
-        return x_m, x_t_out
+            x_t_out = torch.where(mask_me, x_m, x_t_out)
 
-    def __init__(self,thresh_e=0.3, thresh_m=0.3, save_inter = False):
+        return x_m, x_t_out   # mutual_latents latents(target)
+
+    def __init__(
+        self,
+        thresh_e=0.3,
+        thresh_m=0.3,
+        save_inter=False,
+        height=512,
+        width=1024,
+    ):
         self.thresh_e = thresh_e
         self.thresh_m = thresh_m
         self.save_inter = save_inter
-        
-    def set_map(self, ms, alpha, alpha_e, alpha_m,len):
+        self.height = height
+        self.width = width
+
+    def set_map(self, ms, alpha, alpha_e, alpha_m, len):
         self.m = ms
         self.alpha = alpha
         self.alpha_e = alpha_e
@@ -129,7 +187,7 @@ class AttentionControl(abc.ABC):
                 attn = self.forward(attn, is_cross, place_in_unet)
             else:
                 h = attn.shape[0]
-                attn[h // 2:] = self.forward(attn[h // 2:], is_cross, place_in_unet)
+                attn[h // 2 :] = self.forward(attn[h // 2 :], is_cross, place_in_unet)
         self.cur_att_layer += 1
         if self.cur_att_layer == self.num_att_layers // 2 + self.num_uncond_att_layers:
             self.cur_att_layer = 0
@@ -151,7 +209,10 @@ class EmptyControl(AttentionControl):
 
     def forward(self, attn, is_cross: bool, place_in_unet: str):
         return attn
-    def self_attn_forward(self, q, k, v, sim, attn, is_cross, place_in_unet, num_heads, **kwargs):
+
+    def self_attn_forward(
+        self, q, k, v, sim, attn, is_cross, place_in_unet, num_heads, **kwargs
+    ):
         b = q.shape[0] // num_heads
         out = torch.einsum("h i j, h j d -> h i d", attn, v)
         return out
@@ -161,12 +222,28 @@ class AttentionStore(AttentionControl):
 
     @staticmethod
     def get_empty_store():
-        return {"down_cross": [], "mid_cross": [], "up_cross": [],
-                "down_self": [],  "mid_self": [],  "up_self": []}
-
+        return {
+            "down_cross": [],
+            "mid_cross": [],
+            "up_cross": [],
+            "down_self": [],
+            "mid_self": [],
+            "up_self": [],
+        }
     def forward(self, attn, is_cross: bool, place_in_unet: str):
+        """
+        前向传播方法，用于处理注意力图并存储在 step_store 中。
+
+        参数:
+        attn (torch.Tensor): 注意力图张量。
+        is_cross (bool): 指示是否为交叉注意力。
+        place_in_unet (str): UNet 中的位置标识。
+
+        返回:
+        torch.Tensor: 处理后的注意力图张量。
+        """
         key = f"{place_in_unet}_{'cross' if is_cross else 'self'}"
-        if attn.shape[1] <= 32 ** 2:  # avoid memory overhead
+        if attn.shape[1] <= 32**2:  # avoid memory overhead
             self.step_store[key].append(attn)
         return attn
 
@@ -180,7 +257,10 @@ class AttentionStore(AttentionControl):
         self.step_store = self.get_empty_store()
 
     def get_average_attention(self):
-        average_attention = {key: [item / self.cur_step for item in self.attention_store[key]] for key in self.attention_store}
+        average_attention = {
+            key: [item / self.cur_step for item in self.attention_store[key]]
+            for key in self.attention_store
+        }
         return average_attention
 
     def reset(self):
@@ -196,14 +276,16 @@ class AttentionStore(AttentionControl):
 
 class AttentionControlEdit(AttentionStore, abc.ABC):
 
-    def step_callback(self,i, t, x_s, x_t, x_m, alpha_prod):
-        if (self.local_blend is not None) and (i>0):
-            use_xm = (self.cur_step+self.start_steps+1 == self.num_steps)
-            x_m, x_t = self.local_blend(i, x_s, x_t, x_m, self.attention_store, alpha_prod, use_xm=use_xm)
+    def step_callback(self, i, t, x_s, x_t, x_m, alpha_prod):
+        if (self.local_blend is not None) and (i > 0):
+            use_xm = self.cur_step + self.start_steps + 1 == self.num_steps
+            x_m, x_t = self.local_blend(
+                i, x_s, x_t, x_m, self.attention_store, alpha_prod, use_xm=use_xm
+            )
         return x_m, x_t
 
     def replace_self_attention(self, attn_base, att_replace):
-        if att_replace.shape[2] <= 16 ** 2:
+        if att_replace.shape[2] <= 16**2:
             return attn_base.unsqueeze(0).expand(att_replace.shape[0], *attn_base.shape)
         else:
             return att_replace
@@ -211,109 +293,166 @@ class AttentionControlEdit(AttentionStore, abc.ABC):
     @abc.abstractmethod
     def replace_cross_attention(self, attn_base, att_replace):
         raise NotImplementedError
-    
-    def attn_batch(self, q, k, v, sim, attn, is_cross, place_in_unet, num_heads, **kwargs):
+
+    def attn_batch(
+        self, q, k, v, sim, attn, is_cross, place_in_unet, num_heads, **kwargs
+    ):
         b = q.shape[0] // num_heads
 
         sim = torch.einsum("h i d, h j d -> h i j", q, k) * kwargs.get("scale")
         attn = sim.softmax(-1)
         out = torch.einsum("h i j, h j d -> h i d", attn, v)
         return out
-    
+
     def self_attn_forward(self, q, k, v, num_heads):
-        if q.shape[0]//num_heads == 3:
-            if (self.self_replace_steps <= ((self.cur_step+self.start_steps+1)*1.0 / self.num_steps) ):
-                q=torch.cat([q[:num_heads*2],q[num_heads:num_heads*2]])
-                k=torch.cat([k[:num_heads*2],k[:num_heads]])
-                v=torch.cat([v[:num_heads*2],v[:num_heads]])
+        if q.shape[0] // num_heads == 3:
+            if self.self_replace_steps <= (
+                (self.cur_step + self.start_steps + 1) * 1.0 / self.num_steps
+            ):
+                q = torch.cat([q[: num_heads * 2], q[num_heads : num_heads * 2]])
+                k = torch.cat([k[: num_heads * 2], k[:num_heads]])
+                v = torch.cat([v[: num_heads * 2], v[:num_heads]])
             else:
-                q=torch.cat([q[:num_heads],q[:num_heads],q[:num_heads]])
-                k=torch.cat([k[:num_heads],k[:num_heads],k[:num_heads]])
-                v=torch.cat([v[:num_heads*2],v[:num_heads]])
-            return q,k,v
+                q = torch.cat([q[:num_heads], q[:num_heads], q[:num_heads]])
+                k = torch.cat([k[:num_heads], k[:num_heads], k[:num_heads]])
+                v = torch.cat([v[: num_heads * 2], v[:num_heads]])
+            return q, k, v
         else:
             qu, qc = q.chunk(2)
             ku, kc = k.chunk(2)
             vu, vc = v.chunk(2)
-            if (self.self_replace_steps <= ((self.cur_step+self.start_steps+1)*1.0 / self.num_steps) ):
-                qu=torch.cat([qu[:num_heads*2],qu[num_heads:num_heads*2]])
-                qc=torch.cat([qc[:num_heads*2],qc[num_heads:num_heads*2]])
-                ku=torch.cat([ku[:num_heads*2],ku[:num_heads]])
-                kc=torch.cat([kc[:num_heads*2],kc[:num_heads]])
-                vu=torch.cat([vu[:num_heads*2],vu[:num_heads]])
-                vc=torch.cat([vc[:num_heads*2],vc[:num_heads]])
+            if self.self_replace_steps <= (
+                (self.cur_step + self.start_steps + 1) * 1.0 / self.num_steps
+            ):
+                qu = torch.cat([qu[: num_heads * 2], qu[num_heads : num_heads * 2]])
+                qc = torch.cat([qc[: num_heads * 2], qc[num_heads : num_heads * 2]])
+                ku = torch.cat([ku[: num_heads * 2], ku[:num_heads]])
+                kc = torch.cat([kc[: num_heads * 2], kc[:num_heads]])
+                vu = torch.cat([vu[: num_heads * 2], vu[:num_heads]])
+                vc = torch.cat([vc[: num_heads * 2], vc[:num_heads]])
             else:
-                qu=torch.cat([qu[:num_heads],qu[:num_heads],qu[:num_heads]])
-                qc=torch.cat([qc[:num_heads],qc[:num_heads],qc[:num_heads]])
-                ku=torch.cat([ku[:num_heads],ku[:num_heads],ku[:num_heads]])
-                kc=torch.cat([kc[:num_heads],kc[:num_heads],kc[:num_heads]])
-                vu=torch.cat([vu[:num_heads*2],vu[:num_heads]])
-                vc=torch.cat([vc[:num_heads*2],vc[:num_heads]])
+                qu = torch.cat([qu[:num_heads], qu[:num_heads], qu[:num_heads]])
+                qc = torch.cat([qc[:num_heads], qc[:num_heads], qc[:num_heads]])
+                ku = torch.cat([ku[:num_heads], ku[:num_heads], ku[:num_heads]])
+                kc = torch.cat([kc[:num_heads], kc[:num_heads], kc[:num_heads]])
+                vu = torch.cat([vu[: num_heads * 2], vu[:num_heads]])
+                vc = torch.cat([vc[: num_heads * 2], vc[:num_heads]])
 
-            return torch.cat([qu, qc], dim=0) ,torch.cat([ku, kc], dim=0), torch.cat([vu, vc], dim=0)
+            return (
+                torch.cat([qu, qc], dim=0),
+                torch.cat([ku, kc], dim=0),
+                torch.cat([vu, vc], dim=0),
+            )
 
     def forward(self, attn, is_cross: bool, place_in_unet: str):
-        if is_cross :
+        if is_cross:
             h = attn.shape[0] // self.batch_size
-            attn = attn.reshape(self.batch_size,h,  *attn.shape[1:])
-            attn_base, attn_repalce,attn_masa = attn[0], attn[1], attn[2]
-            attn_replace_new = self.replace_cross_attention(attn_masa, attn_repalce) 
+            attn = attn.reshape(self.batch_size, h, *attn.shape[1:])
+            attn_base, attn_repalce, attn_masa = attn[0], attn[1], attn[2]
+            attn_replace_new = self.replace_cross_attention(attn_masa, attn_repalce)
             attn_base_store = self.replace_cross_attention(attn_base, attn_repalce)
-            if (self.cross_replace_steps >= ((self.cur_step+self.start_steps+1)*1.0 / self.num_steps) ):
+            if self.cross_replace_steps >= (
+                (self.cur_step + self.start_steps + 1) * 1.0 / self.num_steps
+            ):
                 attn[1] = attn_base_store
-            attn_store=torch.cat([attn_base_store,attn_replace_new])
+            attn_store = torch.cat([attn_base_store, attn_replace_new])
             attn = attn.reshape(self.batch_size * h, *attn.shape[2:])
-            attn_store = attn_store.reshape(2 *h, *attn_store.shape[2:])
-            super(AttentionControlEdit, self).forward(attn_store, is_cross, place_in_unet)
+            attn_store = attn_store.reshape(2 * h, *attn_store.shape[2:])
+            super(AttentionControlEdit, self).forward(
+                attn_store, is_cross, place_in_unet
+            )
         return attn
 
-    def __init__(self, prompts, num_steps: int,start_steps: int,
-                 cross_replace_steps: Union[float, Tuple[float, float], Dict[str, Tuple[float, float]]],
-                 self_replace_steps: Union[float, Tuple[float, float]],
-                 local_blend: Optional[LocalBlend]):
+    def __init__(
+        self,
+        prompts,
+        num_steps: int,
+        start_steps: int,
+        cross_replace_steps: Union[
+            float, Tuple[float, float], Dict[str, Tuple[float, float]]
+        ],
+        self_replace_steps: Union[float, Tuple[float, float]],
+        local_blend: Optional[LocalBlend],
+    ):
         super(AttentionControlEdit, self).__init__()
-        self.batch_size = len(prompts)+1
+        self.batch_size = len(prompts) + 1
         self.self_replace_steps = self_replace_steps
         self.cross_replace_steps = cross_replace_steps
-        self.num_steps=num_steps
-        self.start_steps=start_steps
+        self.num_steps = num_steps
+        self.start_steps = start_steps
         self.local_blend = local_blend
 
 
 class AttentionReplace(AttentionControlEdit):
 
     def replace_cross_attention(self, attn_base, att_replace):
-        return torch.einsum('hpw,bwn->bhpn', attn_base, self.mapper)
+        return torch.einsum("hpw,bwn->bhpn", attn_base, self.mapper)
 
-    def __init__(self, prompts, num_steps: int, cross_replace_steps: float, self_replace_steps: float,
-                 local_blend: Optional[LocalBlend] = None):
-        super(AttentionReplace, self).__init__(prompts, num_steps, cross_replace_steps, self_replace_steps, local_blend)
-        self.mapper = seq_aligner.get_replacement_mapper(prompts, tokenizer).to(device).to(torch_dtype)
+    def __init__(
+        self,
+        prompts,
+        num_steps: int,
+        cross_replace_steps: float,
+        self_replace_steps: float,
+        local_blend: Optional[LocalBlend] = None,
+    ):
+        super(AttentionReplace, self).__init__(
+            prompts, num_steps, cross_replace_steps, self_replace_steps, local_blend
+        )
+        self.mapper = (
+            seq_aligner.get_replacement_mapper(prompts, tokenizer)
+            .to(device)
+            .to(torch_dtype)
+        )
 
 
 class AttentionRefine(AttentionControlEdit):
 
     def replace_cross_attention(self, attn_masa, att_replace):
         attn_masa_replace = attn_masa[:, :, self.mapper].squeeze()
-        attn_replace = attn_masa_replace * self.alphas + \
-                 att_replace * (1 - self.alphas)
+        attn_replace = attn_masa_replace * self.alphas + att_replace * (1 - self.alphas)
         return attn_replace
 
-    def __init__(self, prompts, prompt_specifiers, num_steps: int,start_steps: int, cross_replace_steps: float, self_replace_steps: float,
-                 local_blend: Optional[LocalBlend] = None):
-        super(AttentionRefine, self).__init__(prompts, num_steps,start_steps, cross_replace_steps, self_replace_steps, local_blend)
-        self.mapper, alphas, ms, alpha_e, alpha_m = seq_aligner.get_refinement_mapper(prompts, prompt_specifiers, tokenizer, encoder, device)
-        self.mapper, alphas, ms = self.mapper.to(device), alphas.to(device).to(torch_dtype), ms.to(device).to(torch_dtype)
+    def __init__(
+        self,
+        prompts,
+        prompt_specifiers,
+        num_steps: int,
+        start_steps: int,
+        cross_replace_steps: float,
+        self_replace_steps: float,
+        local_blend: Optional[LocalBlend] = None,
+    ):
+        super(AttentionRefine, self).__init__(
+            prompts,
+            num_steps,
+            start_steps,
+            cross_replace_steps,
+            self_replace_steps,
+            local_blend,
+        )
+        self.mapper, alphas, ms, alpha_e, alpha_m = seq_aligner.get_refinement_mapper(
+            prompts, prompt_specifiers, tokenizer, encoder, device
+        )
+        self.mapper, alphas, ms = (
+            self.mapper.to(device),
+            alphas.to(device).to(torch_dtype),
+            ms.to(device).to(torch_dtype),
+        )
         self.alphas = alphas.reshape(alphas.shape[0], 1, 1, alphas.shape[1])
         self.ms = ms.reshape(ms.shape[0], 1, 1, ms.shape[1])
         ms = ms.to(device)
         alpha_e = alpha_e.to(device)
         alpha_m = alpha_m.to(device)
         t_len = len(tokenizer(prompts[1])["input_ids"])
-        self.local_blend.set_map(ms,alphas,alpha_e,alpha_m,t_len)
+        self.local_blend.set_map(ms, alphas, alpha_e, alpha_m, t_len)
 
 
-def get_equalizer(text: str, word_select: Union[int, Tuple[int, ...]], values: Union[List[float], Tuple[float, ...]]):
+def get_equalizer(
+    text: str,
+    word_select: Union[int, Tuple[int, ...]],
+    values: Union[List[float], Tuple[float, ...]],
+):
     if type(word_select) is int or type(word_select) is str:
         word_select = (word_select,)
     equalizer = torch.ones(len(values), 77)
@@ -324,51 +463,102 @@ def get_equalizer(text: str, word_select: Union[int, Tuple[int, ...]], values: U
     return equalizer
 
 
-def inference(img, source_prompt, target_prompt,
-          local, mutual,
-          positive_prompt, negative_prompt,
-          guidance_s, guidance_t,
-          num_inference_steps,
-          width, height, seed, strength,          
-          cross_replace_steps, self_replace_steps, 
-          thresh_e, thresh_m, denoise, user_instruct="", api_key=""):
+def inference(
+    img,
+    source_prompt,
+    target_prompt,
+    local,
+    mutual,
+    positive_prompt,
+    negative_prompt,
+    guidance_s,
+    guidance_t,
+    num_inference_steps,
+    width,
+    height,
+    seed,
+    strength,
+    cross_replace_steps,
+    self_replace_steps,
+    thresh_e,
+    thresh_m,
+    denoise,
+    user_instruct="",
+    api_key="",
+):
     print(img)
     if user_instruct != "" and api_key != "":
-        source_prompt, target_prompt, local, mutual, replace_steps, num_inference_steps = get_params(api_key, user_instruct)
+        (
+            source_prompt,
+            target_prompt,
+            local,
+            mutual,
+            replace_steps,
+            num_inference_steps,
+        ) = get_params(api_key, user_instruct)
         cross_replace_steps = replace_steps
         self_replace_steps = replace_steps
 
     torch.manual_seed(seed)
-    ratio = min(height / img.height, width / img.width)
-    img = img.resize((int(img.width * ratio), int(img.height * ratio)))
+
+    # ratio = min(height / img.height, width / img.width)
+    # img = img.resize((int(img.width * ratio), int(img.height * ratio)))
+    def concatenate_images_horizontally(image: Image.Image, output_path):
+
+        width, height = image.size
+        left_half = image.crop((0, 0, 3 * width // 4, height))
+        right_half = image.crop((3 * width // 4, 0, width, height))
+
+        extended_image = Image.new("RGB", (width * 2, height))
+        extended_image.paste(right_half, (0, 0))
+        extended_image.paste(image, (width * 1 // 4, 0))
+        extended_image.paste(left_half, (width * 5 // 4, 0))
+
+        extended_image.save(output_path)
+        return extended_image
+
+    # img = concatenate_images_horizontally(img, "extended.png")
+
+    # print(f"img.shape={img.size}")
+
     if denoise is False:
         strength = 1
-    num_denoise_num = math.trunc(num_inference_steps*strength)
-    num_start = num_inference_steps-num_denoise_num
+    num_denoise_num = math.trunc(num_inference_steps * strength)
+    num_start = num_inference_steps - num_denoise_num
     # create the CAC controller.
     local_blend = LocalBlend(thresh_e=thresh_e, thresh_m=thresh_m, save_inter=True)
-    controller = AttentionRefine([source_prompt, target_prompt],[[local, mutual]],
-                    num_inference_steps,
-                    num_start,
-                    cross_replace_steps=cross_replace_steps,
-                    self_replace_steps=self_replace_steps,
-                    local_blend=local_blend
-                    )
+    controller = AttentionRefine(
+        [source_prompt, target_prompt],
+        [[local, mutual]],
+        num_inference_steps,
+        num_start,
+        cross_replace_steps=cross_replace_steps,
+        self_replace_steps=self_replace_steps,
+        local_blend=local_blend,
+    )
     ptp_utils.register_attention_control(pipe, controller)
-
-    results = pipe(prompt=target_prompt,
-                   source_prompt=source_prompt,
-                   positive_prompt=positive_prompt,
-                   negative_prompt=negative_prompt,
-                   image=img,
-                   num_inference_steps=num_inference_steps,
-                   eta=1,
-                   strength=strength,
-                   guidance_scale=guidance_t,
-                   source_guidance_scale=guidance_s,
-                   denoise_model=denoise,
-                   callback = controller.step_callback
-                   )
+    try:
+        with profile(activities=[ProfilerActivity.CPU], record_shapes=True) as prof:
+            with record_function("model_inference"):
+                results = pipe(
+                    prompt=target_prompt,
+                    source_prompt=source_prompt,
+                    positive_prompt=positive_prompt,
+                    negative_prompt=negative_prompt,
+                    image=img,
+                    num_inference_steps=num_inference_steps,
+                    eta=1,
+                    strength=strength,
+                    guidance_scale=guidance_t,
+                    source_guidance_scale=guidance_s,
+                    denoise_model=denoise,
+                    callback=controller.step_callback,
+                )
+    except Exception as e:
+        print(e)
+        # print(prof.key_averages(group_by_input_shape=True).table(sort_by="cpu_time_total", row_limit=10))
+        prof.export_chrome_trace("trace.json")
+        return Image.open("images/Elon_Musk.webp")
 
     return replace_nsfw_images(results)
 
@@ -453,23 +643,36 @@ More steps mean that the edit effect is more pronounced.
 - For style editing and remove tasks, you can choose a larger value, like 25 steps.
 - If you feel the task is extremely difficult (like some kinds of styles or removing very tiny stuffs), you can directly use 50 steps.
 """
+
+
 def get_params(api_key, user_instruct):
     from openai import OpenAI
+
     client = OpenAI(api_key=api_key)
     print("user_instruct", user_instruct)
     response = client.chat.completions.create(
-    model="gpt-4-1106-preview",
-    messages=[
-        {"role": "system", "content": param_bot_prompt},
-        {"role": "user", "content": user_instruct}
-    ],
-    response_format={ "type": "json_object" },
+        model="gpt-4-1106-preview",
+        messages=[
+            {"role": "system", "content": param_bot_prompt},
+            {"role": "user", "content": user_instruct},
+        ],
+        response_format={"type": "json_object"},
     )
     param_dict = response.choices[0].message.content
     print("param_dict", param_dict)
     import json
+
     param_dict = json.loads(param_dict)
-    return param_dict['source_prompt'], param_dict['target_prompt'], param_dict['target_sub'], param_dict['mutual_sub'], param_dict['attention_control'], param_dict['steps']
+    return (
+        param_dict["source_prompt"],
+        param_dict["target_prompt"],
+        param_dict["target_sub"],
+        param_dict["mutual_sub"],
+        param_dict["attention_control"],
+        param_dict["steps"],
+    )
+
+
 with gr.Blocks(css=css) as demo:
     gr.HTML(intro)
     with gr.Accordion("README", open=False):
@@ -492,107 +695,198 @@ with gr.Blocks(css=css) as demo:
                 image_out = gr.Image(label="Output image", height=512)
 
         with gr.Column(scale=45):
-            
+
             with gr.Tab("UAC options"):
                 with gr.Group():
                     with gr.Row():
-                        source_prompt = gr.Textbox(label="Source prompt", placeholder="Source prompt describes the input image")
+                        source_prompt = gr.Textbox(
+                            label="Source prompt",
+                            placeholder="Source prompt describes the input image",
+                        )
                     with gr.Row():
-                        guidance_s = gr.Slider(label="Source guidance scale", value=1, minimum=1, maximum=10)
-                        positive_prompt = gr.Textbox(label="Positive prompt", placeholder="")
+                        guidance_s = gr.Slider(
+                            label="Source guidance scale",
+                            value=1,
+                            minimum=1,
+                            maximum=10,
+                        )
+                        positive_prompt = gr.Textbox(
+                            label="Positive prompt", placeholder=""
+                        )
                     with gr.Row():
-                        target_prompt = gr.Textbox(label="Target prompt", placeholder="Target prompt describes the output image")
+                        target_prompt = gr.Textbox(
+                            label="Target prompt",
+                            placeholder="Target prompt describes the output image",
+                        )
                     with gr.Row():
-                        guidance_t = gr.Slider(label="Target guidance scale", value=2, minimum=1, maximum=10)
-                        negative_prompt = gr.Textbox(label="Negative prompt", placeholder="")
+                        guidance_t = gr.Slider(
+                            label="Target guidance scale",
+                            value=2,
+                            minimum=1,
+                            maximum=10,
+                        )
+                        negative_prompt = gr.Textbox(
+                            label="Negative prompt", placeholder=""
+                        )
                     with gr.Row():
                         local = gr.Textbox(label="Target blend", placeholder="")
-                        thresh_e = gr.Slider(label="Target blend thresh", value=0.6, minimum=0, maximum=1)
+                        thresh_e = gr.Slider(
+                            label="Target blend thresh", value=0.6, minimum=0, maximum=1
+                        )
                     with gr.Row():
                         mutual = gr.Textbox(label="Source blend", placeholder="")
-                        thresh_m = gr.Slider(label="Source blend thresh", value=0.6, minimum=0, maximum=1)
+                        thresh_m = gr.Slider(
+                            label="Source blend thresh", value=0.6, minimum=0, maximum=1
+                        )
                     with gr.Row():
-                        cross_replace_steps = gr.Slider(label="Cross attn control schedule", value=0.7, minimum=0.0, maximum=1, step=0.01)
-                        self_replace_steps = gr.Slider(label="Self attn control schedule", value=0.3, minimum=0.0, maximum=1, step=0.01)
+                        cross_replace_steps = gr.Slider(
+                            label="Cross attn control schedule",
+                            value=0.7,
+                            minimum=0.0,
+                            maximum=1,
+                            step=0.01,
+                        )
+                        self_replace_steps = gr.Slider(
+                            label="Self attn control schedule",
+                            value=0.3,
+                            minimum=0.0,
+                            maximum=1,
+                            step=0.01,
+                        )
                     with gr.Row():
-                        denoise = gr.Checkbox(label='Denoising Mode', value=False)
-                        strength = gr.Slider(label="Strength", value=0.7, minimum=0, maximum=1, step=0.01, visible=False)
-                        denoise.change(fn=lambda value: gr.update(visible=value), inputs=denoise, outputs=strength)
+                        denoise = gr.Checkbox(label="Denoising Mode", value=False)
+                        strength = gr.Slider(
+                            label="Strength",
+                            value=0.7,
+                            minimum=0,
+                            maximum=1,
+                            step=0.01,
+                            visible=False,
+                        )
+                        denoise.change(
+                            fn=lambda value: gr.update(visible=value),
+                            inputs=denoise,
+                            outputs=strength,
+                        )
                     with gr.Row():
                         generate1 = gr.Button(value="Run")
 
             with gr.Tab("Advanced options"):
                 with gr.Group():
                     with gr.Row():
-                        num_inference_steps = gr.Slider(label="Inference steps", value=15, minimum=1, maximum=50, step=1)
-                        width = gr.Slider(label="Width", value=512, minimum=512, maximum=1024, step=8)
-                        height = gr.Slider(label="Height", value=512, minimum=512, maximum=1024, step=8)
+                        num_inference_steps = gr.Slider(
+                            label="Inference steps",
+                            value=15,
+                            minimum=1,
+                            maximum=50,
+                            step=1,
+                        )
+                        width = gr.Slider(
+                            label="Width", value=512, minimum=512, maximum=1024, step=8
+                        )
+                        height = gr.Slider(
+                            label="Height", value=512, minimum=512, maximum=1024, step=8
+                        )
                     with gr.Row():
-                        seed = gr.Slider(0, 2147483647, label='Seed', value=0, step=1)
+                        seed = gr.Slider(0, 2147483647, label="Seed", value=0, step=1)
                     with gr.Row():
                         generate3 = gr.Button(value="Run")
 
             with gr.Tab("Instruction following (+GPT4)"):
                 guide_str = """Describe the image you uploaded and tell me how you want to edit it."""
                 with gr.Group():
-                    api_key = gr.Textbox(label="YOUR OPENAI API KEY", placeholder="sk-xxx", lines = 1, type="password")
-                    user_instruct = gr.Textbox(label=guide_str, placeholder="The image shows an apple on the table and I want to change the apple to a banana.", lines = 3)
+                    api_key = gr.Textbox(
+                        label="YOUR OPENAI API KEY",
+                        placeholder="sk-xxx",
+                        lines=1,
+                        type="password",
+                    )
+                    user_instruct = gr.Textbox(
+                        label=guide_str,
+                        placeholder="The image shows an apple on the table and I want to change the apple to a banana.",
+                        lines=3,
+                    )
                     with gr.Row():
                         generate4 = gr.Button(value="Run")
 
-    inputs1 = [img, source_prompt, target_prompt,
-          local, mutual,
-          positive_prompt, negative_prompt,
-          guidance_s, guidance_t,
-          num_inference_steps,
-          width, height, seed, strength,          
-          cross_replace_steps, self_replace_steps, 
-          thresh_e, thresh_m, denoise]
-    inputs4 =[img, source_prompt, target_prompt,
-          local, mutual,
-          positive_prompt, negative_prompt,
-          guidance_s, guidance_t,
-          num_inference_steps,
-          width, height, seed, strength,          
-          cross_replace_steps, self_replace_steps, 
-          thresh_e, thresh_m, denoise, user_instruct, api_key]
+    inputs1 = [
+        img,
+        source_prompt,
+        target_prompt,
+        local,
+        mutual,
+        positive_prompt,
+        negative_prompt,
+        guidance_s,
+        guidance_t,
+        num_inference_steps,
+        width,
+        height,
+        seed,
+        strength,
+        cross_replace_steps,
+        self_replace_steps,
+        thresh_e,
+        thresh_m,
+        denoise,
+    ]
+    inputs4 = [
+        img,
+        source_prompt,
+        target_prompt,
+        local,
+        mutual,
+        positive_prompt,
+        negative_prompt,
+        guidance_s,
+        guidance_t,
+        num_inference_steps,
+        width,
+        height,
+        seed,
+        strength,
+        cross_replace_steps,
+        self_replace_steps,
+        thresh_e,
+        thresh_m,
+        denoise,
+        user_instruct,
+        api_key,
+    ]
     generate1.click(inference, inputs=inputs1, outputs=image_out)
     generate3.click(inference, inputs=inputs1, outputs=image_out)
     generate4.click(inference, inputs=inputs4, outputs=image_out)
 
+    with open("configs/default.yml") as f:
+        default_cfg = yaml.safe_load(f)
+    examples = [list(multi_v.values()) for _, multi_v in default_cfg.items()]
+    print(examples)
+
     ex = gr.Examples(
+        examples,
         [
-          ["images/corgi.jpg","corgi","cat","cat","","","",1,2,15,512,512,0,1,0.7,0.7,0.6,0.6,False],         
-          ["images/muffin.png","muffin","chihuahua","chihuahua","","","",1,2,15,512,512,0,1,0.65,0.6,0.4,0.7,False],   
-          ["images/InfEdit.jpg","an anime girl holding a pad","an anime girl holding a book","book","girl ","","",1,2,15,512,512,0,1,0.8,0.8,0.6,0.6,False],  
-          ["images/summer.jpg","a photo of summer scene","A photo of winter scene","","","","",1,2,15,512,512,0,1,1,1,0.6,0.7,False],  
-          ["images/bear.jpg","A bear sitting on the ground","A bear standing on the ground","bear","","","",1,1.5,15,512,512,0,1,0.3,0.3,0.5,0.7,False], 
-          ["images/james.jpg","a man playing basketball","a man playing soccer","soccer","man ","","",1,2,15,512,512,0,1,0,0,0.5,0.4,False],  
-          ["images/osu.jfif","A football with OSU logo","A football with Umich logo","logo","","","",1,2,15,512,512,0,1,0.5,0,0.6,0.7,False],   
-          ["images/groundhog.png","A anime groundhog head","A anime ferret head","head","","","",1,2,15,512,512,0,1,0.5,0.5,0.6,0.7,False], 
-          ["images/miku.png","A anime girl with green hair and green eyes and shirt","A anime girl with red hair and red eyes and shirt","red hair and red eyes","shirt","","",1,2,15,512,512,0,1,1,1,0.2,0.8,False],   
-          ["images/droplet.png","a blue droplet emoji with a smiling face with yellow dot","a red fire emoji with an angry face with yellow dot","","yellow dot","","",1,2,15,512,512,0,1,0.7,0.7,0.6,0.7,False],   
-          ["images/moyu.png","an emoji holding a sign and a fish","an emoji holding a sign and a shark","shark","sign","","",1,2,15,512,512,0,1,0.7,0.7,0.5,0.7,False],
-          ["images/214000000000.jpg","a painting of a waterfall in the mountains","a painting of a waterfall and angels in the mountains","angels","","","",1,2,15,512,512,0,1,0,0,0.5,0.5,False],
-            ["images/311000000002.jpg","a lion in a suit sitting at a table with a laptop","a lion in a suit sitting at a table with nothing","nothing","","","",1,2,15,512,512,0,1,0,0,0.5,0.5,False],
-            ["images/genshin.png","anime girl, with blue logo","anime boy with golden hair named Link, from The Legend of Zelda, with legend of zelda logo","anime boy","","","",1,2,50,512,512,0,1,0.65,0.65,0.5,0.5,False],
-            ["images/angry.jpg","a man with bounding boxes at the door","a man with angry birds at the door","angry birds","a man","","",1,2,15,512,512,0,1,0.3,0.1,0.45,0.4,False],
-            ["images/Doom_Slayer.jpg","doom slayer from game doom","master chief from game halo","","","","",1,2,15,512,512,0,1,0.6,0.8,0.7,0.7,False],
-          ["images/Elon_Musk.webp","Elon Musk in front of a car","Mark Iv iron man suit in front of a car","Mark Iv iron man suit","car","","",1,2,15,512,512,0,1,0.5,0.3,0.6,0.7,False],
-            ["images/dragon.jpg","a mascot dragon","pixel art, a mascot dragon","","","","",1,2,25,512,512,0,1,0.7,0.7,0.6,0.6,False],
-            ["images/frieren.jpg","a anime girl with long white hair holding a bottle","a anime girl with long white hair holding a smartphone","smartphone","","","",1,2,15,512,512,0,1,0.7,0.7,0.7,0.7,False],
-            ["images/sam.png","a man with an openai logo","a man with a twitter logo","a twitter logo","a man","","",1,2,15,512,512,0,0.8,0,0,0.3,0.6,True],
-            
-
+            img,
+            source_prompt,
+            target_prompt,
+            local,
+            mutual,
+            positive_prompt,
+            negative_prompt,
+            guidance_s,
+            guidance_t,
+            num_inference_steps,
+            width,
+            height,
+            seed,
+            strength,
+            cross_replace_steps,
+            self_replace_steps,
+            thresh_e,
+            thresh_m,
+            denoise,
         ],
-        [img, source_prompt, target_prompt,
-          local, mutual,
-          positive_prompt, negative_prompt,
-          guidance_s, guidance_t,
-          num_inference_steps,
-          width, height, seed, strength,          
-          cross_replace_steps, self_replace_steps, 
-          thresh_e, thresh_m, denoise],
-        image_out, inference, examples_per_page=20)
+        image_out,
+        inference,
+        examples_per_page=20,
+    )
 demo.launch(debug=False, share=False)
-
