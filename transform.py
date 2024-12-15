@@ -60,6 +60,7 @@ class PanoramaConverter:
             v = ((theta + np.pi / 2) / np.pi) * h
 
             # 双线性插值采样
+            # TODO: 这里可以优化为更高效的插值方法
             u = np.clip(u, 0, w - 1)
             v = np.clip(v, 0, h - 1)
             face = cv2.remap(
@@ -69,6 +70,32 @@ class PanoramaConverter:
             result[face_name] = face
 
         return result
+
+    def inverse_convert(self, faces: Dict[str, np.ndarray]) -> np.ndarray:
+        """将立方体贴图转换回全景图"""
+        h, w = self.output_size * 2, self.output_size * 4
+        panorama = np.zeros((h, w, 3), dtype=np.uint8)
+        x_grid, y_grid = self._create_face_coordinates()
+
+        for face_name, direction in self.faces.items():
+            face = faces[face_name]
+            x, y, z = self._calculate_xyz(direction, x_grid, y_grid)
+
+            # 计算球面坐标
+            phi = np.arctan2(z, x)
+            theta = np.arctan2(y, np.sqrt(x * x + z * z))
+
+            # 映射到全景图
+            u = ((phi + np.pi) / (2 * np.pi)) * w
+            v = ((theta + np.pi / 2) / np.pi) * h
+
+            # 双线性插值采样
+            u = np.clip(u, 0, w - 1).astype(np.int32)
+            v = np.clip(v, 0, h - 1).astype(np.int32)
+
+            panorama[v, u] = face[y_grid.astype(np.int32), x_grid.astype(np.int32)]
+
+        return panorama
 
 
 def main():

@@ -1,3 +1,6 @@
 __pycache__/
 inter/
 tmp/
+inter_latents/
+trace.json
+
